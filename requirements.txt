@@ -1,0 +1,5 @@
+dynestyx
+numpyro
+jax[cpu]
+matplotlib
+ipykernel
