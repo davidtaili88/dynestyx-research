@@ -2,4 +2,5 @@ dynestyx
 numpyro
 jax[cpu]
 matplotlib
+arviz
 ipykernel
