@@ -50,7 +50,41 @@ K = 3
 # recall (see the big note in regime_model and [[drawdown-channel-breakthrough]]). Set
 # False to recover the original 2-channel [r_t, v_t] model (fit/filter auto-adapt).
 INCLUDE_DRAWDOWN = True
-_DRAWDOWN_WINDOW_WEEKS = 52  # 1yr; chosen by sweep (only window that keeps false-alarm flat)
+_DRAWDOWN_WINDOW_WEEKS = 52  # 1yr; only used when _DRAWDOWN_RESET_PCT is None (trailing-window peak)
+# DRAWDOWN REFERENCE PEAK. None -> 52wk TRAILING-WINDOW peak (original). A float (e.g. 0.20)
+# -> EVENT-RESET peak: reference holds the pre-crash high through a bear, resets when price
+# rises reset_pct off the trough (a confirmed +20% recovery = textbook new bull). Fixes the
+# recovery LAG / false-alarm at the SOURCE (dd clears ~9mo sooner in a recovery) without a
+# 2nd channel -- see data.drawdown() + [[drawdown-window-is-wrong-knob]]. 0.20 is the round
+# literature threshold, defines a FEATURE not the regime (the HMM still decides the state).
+_DRAWDOWN_RESET_PCT = 0.20
+
+# DRAWDOWN EMISSION FAMILY. dd = price/peak - 1 is HARD-BOUNDED at 0 with a LITERAL point
+# mass there (in a bull, price IS its own peak -> dd == 0.0 exactly; ~20% of all weeks,
+# ~27% of bull weeks). A single continuous density (the "normal" option) CANNOT represent
+# a point mass -- it assigns probability 0 to any exact value -- so it smears the atom and
+# mis-centers (that's why the Normal fit pulled dd_bull to -0.064, not ~0). "hurdle_logt"
+# is the correct structure: a HURDLE (Bernoulli gate at dd==0: "at peak" vs "underwater")
+# times a log-Student-t slab on u=-dd>0 for HOW FAR underwater. log-t (not half-t) because
+# the bear underwater-depth has an INTERIOR mode (peaks ~5% under, not at 0) -- half-families
+# force the mode at the boundary and are structurally wrong. t (not log-Normal) so the tail
+# weight is LEARNED per state (nu), like the r_t/v_t channels; nu->inf recovers log-Normal.
+# All three hurdle quantities are per-state ORDERED LADDERS (bear<tbull<bull for atom-p and
+# for the log-mode), so the calm>turbulent>bear ordering is imposed as STRUCTURE, not fit
+# from the label-less middle rung. See the emission block + diagnostics/drawdown_emission_shape.py
+# and diagnostics/drawdown_peak_tracking.py. "normal" keeps the original Normal for A/B + OOS.
+DD_EMISSION = "normal"   # "normal" (SHIPPED) | "hurdle_logt" (better-specified but WORSE nowcast)
+# EMISSION CHOICE (2026-08-08, decided by a 2x2 ablation over {window,event-reset} dd x
+# {normal,hurdle_logt} emission). The hurdle+log-t is the CORRECTLY-SPECIFIED family (dd is
+# bounded at 0 with a ~20% atom + interior-mode bear bulk -- a Normal is genuinely misspecified).
+# YET it makes the NOWCAST WORSE: it ~triples the recovery EXIT LAG (window 5.0->16.4wk,
+# event 5.7->12.8wk) and raises recovery-false-alarm. WHY: the hurdle fits dd FAITHFULLY, so
+# the model TRUSTS dd more -- and dd is a LAGGING signal in recoveries (still underwater while
+# climbing out). Trusting a laggy channel more = holding bear longer. The Normal's very
+# misspecification DOWN-WEIGHTS dd (smears the atom, inflates scale), so the model leans on
+# r_t/v_t which turn up faster -> shorter lag. So: emission fidelity is NOT the objective;
+# nowcast quality is. We ship the simpler Normal. The event-reset dd (cycle-peak, +20% reset)
+# is KEPT -- the same ablation showed it's neutral-to-good (best recFA 0.200, lag ~flat).
 
 # MACRO CHANNELS (two, COMPLEMENTARY BY ERA -- both target the residual mid-bear whipsaw
 # in slow/rolling-top bears that dd alone doesn't fully damp; see the emission blocks):
@@ -76,8 +110,8 @@ _CREDIT_HORIZON_MONTHS = 5   # peak of a broad 3-8mo plateau in the separation s
 INCLUDE_CURVE = False
 print(INCLUDE_CREDIT, INCLUDE_CURVE)
 # Observation column order MUST match this everywhere (fit, filter, _JointRV indexing).
-# Order: r_t, v_t, then dd, then cs_chg, then inv -- append-only so earlier channels'
-# indices never shift (mirrors observations() append order in data.py).
+# Order: r_t, v_t, then dd, then cs_chg, then inv -- append-only so earlier
+# channels' indices never shift (mirrors observations() append order in data.py).
 _OBS_COLS = ["r_t", "v_t"]
 if INCLUDE_DRAWDOWN:
     _OBS_COLS.append("dd")
@@ -91,6 +125,7 @@ if INCLUDE_CURVE:
 _OBS_KWARGS = dict(
     include_drawdown=INCLUDE_DRAWDOWN,
     drawdown_window_weeks=_DRAWDOWN_WINDOW_WEEKS,
+    drawdown_reset_pct=_DRAWDOWN_RESET_PCT,
     include_credit=INCLUDE_CREDIT,
     credit_horizon_months=_CREDIT_HORIZON_MONTHS,
     include_curve=INCLUDE_CURVE,
@@ -202,6 +237,78 @@ class _JointRV(dist.Distribution):
         keys = jr.split(key, len(self._all))
         parts = [d.sample(keys[i], sample_shape) for i, d in enumerate(self._all)]
         return jnp.stack(parts, axis=-1)
+
+
+class _HurdleLogT(dist.Distribution):
+    """Drawdown emission: a HURDLE (point mass at dd==0) x log-Student-t slab on u=-dd>0.
+
+    dd = price/trailing-peak - 1 is HARD-BOUNDED at 0 with a LITERAL point mass there:
+    in a bull the current price IS its own rolling peak, so the ratio is exactly 1 and
+    dd == 0.0 (not "near 0" -- exactly, ~20% of all weeks, ~27% of bull weeks). A single
+    continuous density CANNOT represent that: it assigns probability 0 to any exact value,
+    so it fights the spike and smears/mis-centers (the old Normal pulled dd_bull to -0.064
+    instead of ~0). The correct structure is a HURDLE:
+
+        dd == 0  (at the peak)      -> probability  p_atom                    [the gate]
+        dd <  0  (underwater by u)  -> probability  (1 - p_atom) * f(u)       [the slab]
+
+    where u = -dd > 0 is the depth underwater and f is a log-Student-t density:
+        log(u) ~ StudentT(nu, logmode + ... , sigma)   =>  u is log-t on (0, inf).
+    log-t (not half-t) because the bear underwater-depth has an INTERIOR mode (peaks ~5%
+    under, not at the boundary) -- half-families force the mode at 0 and are structurally
+    wrong. StudentT (not Normal-in-log = log-Normal) so the TAIL WEIGHT is learned per state
+    via nu (nu -> inf recovers log-Normal), matching the r_t / v_t channels; the deep-crash
+    left tail (u out to 0.52) is what nu absorbs.
+
+    Params are PER-STATE SCALARS (the observation_model selects rung x and passes that
+    rung's values in). `atom_p` in (0,1); `log_mode` is the location of log(u) (its
+    per-state ordered ladder gives bear deepest, bulls shallow); `log_sigma`>0 the spread
+    of log(u); `nu`>2 the log-t dof.
+
+    log_prob returns a scalar per observation (this whole object is ONE channel of the
+    _JointRV vector; the filter sums it with the r/v channels). Branch is jax-safe via
+    jnp.where on (value == 0), with the underwater branch guarded so the log/where never
+    sees a non-positive u (NaN-safe gradients).
+    """
+
+    support = dist.constraints.real  # dd in (-inf, 0]; the two branches partition it at 0
+    arg_constraints = {}
+
+    def __init__(self, atom_p, log_mode, log_sigma, nu, validate_args=None):
+        self.atom_p = atom_p
+        self.log_mode = log_mode
+        self.log_sigma = log_sigma
+        self.nu = nu
+        super().__init__(batch_shape=jnp.shape(atom_p), event_shape=(), validate_args=validate_args)
+
+    def log_prob(self, value):
+        # value = dd <= 0. at_peak := (dd == 0); else underwater with depth u = -dd > 0.
+        at_peak = value >= 0.0  # dd is capped at 0, so >=0 catches the exact-0 atom
+        # Guard u strictly positive INSIDE the where so grads are finite even on atom weeks
+        # (the atom branch discards this value; the guard just keeps log() from seeing <=0).
+        u = jnp.where(at_peak, 1.0, -value)
+        log_u = jnp.log(u)
+
+        # log-t density of u: StudentT(nu, log_mode, log_sigma) on log(u), plus the
+        # change-of-variables Jacobian -log(u)  (since d/du log(u) = 1/u).
+        slab_logp = (
+            dist.StudentT(df=self.nu, loc=self.log_mode, scale=self.log_sigma).log_prob(log_u)
+            - log_u
+        )
+
+        log_p = jnp.log(self.atom_p)
+        log_1mp = jnp.log1p(-self.atom_p)
+        return jnp.where(at_peak, log_p, log_1mp + slab_logp)
+
+    def sample(self, key, sample_shape=()):
+        # For prior/predictive only (NUTS conditions on data). Draw the gate then, if
+        # underwater, draw u=exp(log-t) and return dd=-u; else dd=0.
+        k1, k2 = jr.split(key)
+        shape = sample_shape + self.batch_shape
+        is_peak = jr.bernoulli(k1, self.atom_p, shape=shape)
+        log_u = dist.StudentT(df=self.nu, loc=self.log_mode, scale=self.log_sigma).sample(k2, sample_shape)
+        dd = jnp.where(is_peak, 0.0, -jnp.exp(log_u))
+        return dd
 
 
 def regime_model(obs_times=None, obs_values=None, predict_times=None):
@@ -524,12 +631,58 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
     # Normal emission on dd. [PRIOR] dd_bull, dd_bear_gap, dd_tbull_gap, dd_scale;
     # [STRUCTURAL] the ordered 2-level assignment. -> [PRIOR+STRUCTURAL].
     # ========================================================================
-    if INCLUDE_DRAWDOWN:
+    if INCLUDE_DRAWDOWN and DD_EMISSION == "normal":
         dd_bull = numpyro.sample("dd_bull", dist.Normal(0.0, 0.05))         # bull: ~0 (near peak)
         dd_bear_gap = numpyro.sample("dd_bear_gap", dist.HalfNormal(0.20))  # how far underwater bear is
         dd_tbull_gap = numpyro.sample("dd_tbull_gap", dist.HalfNormal(0.10))  # tbull mildly underwater
         dd_loc = jnp.stack([dd_bull - dd_bear_gap, dd_bull - dd_tbull_gap, dd_bull])  # [BEAR,TBULL,BULL]
         dd_scale = numpyro.sample("dd_scale", dist.HalfNormal(0.15))
+    elif INCLUDE_DRAWDOWN and DD_EMISSION == "hurdle_logt":
+        # ------------------------------------------------------------------
+        # HURDLE x LOG-STUDENT-T (the correct family; see _HurdleLogT + the DD_EMISSION
+        # note). Three PER-STATE quantities, each an ORDERED LADDER (non-negative gaps)
+        # so the economic ordering holds BY CONSTRUCTION, not by luck:
+        #
+        # (1) ATOM PROBABILITY  P(dd == 0) = "at the peak".  Ladder ENFORCES
+        #     calm_bull > turbulent_bull > bear.  Priors set the MEANS to ~0.2 / 0.1 / 0.01:
+        #     a calm bull sits at a fresh high often; a turbulent bull less so (it wobbles);
+        #     a bear almost never (~0.01). bear is the base; each bull adds a >=0 gap. The
+        #     bear/turbulent atoms are label-less (turbulent bull has no external referent),
+        #     so this ORDERING is IMPOSED structure -- exactly the honest way to handle the
+        #     latent middle rung: assert the inequality, not a fitted value. [PRIOR+STRUCTURAL]
+        p_bear0 = numpyro.sample("prob_maxdd_is_0_bear", dist.Beta(1.0, 99.0))        # ~0.01
+        p_gap_tbull = numpyro.sample("prob_maxdd_is_0_gap_tbull", dist.HalfNormal(0.10))  # -> ~0.10
+        p_gap_cbull = numpyro.sample("prob_maxdd_is_0_gap_calm_bull", dist.HalfNormal(0.10))  # -> ~0.20
+        p_tbull0 = p_bear0 + p_gap_tbull
+        p_cbull0 = p_tbull0 + p_gap_cbull
+        # clip into (eps, 1-eps) for numerical safety of log/log1p in the hurdle.
+        _eps = 1e-4
+        dd_atom_p = jnp.clip(jnp.stack([p_bear0, p_tbull0, p_cbull0]), _eps, 1.0 - _eps)  # [BEAR,TBULL,BULL]
+        # Named views (recorded) so the fit summary reads clearly per state.
+        numpyro.deterministic("prob_maxdd_is_0_turbulent_bull", dd_atom_p[TURBULENT_BULL])
+        numpyro.deterministic("prob_maxdd_is_0_calm_bull", dd_atom_p[BULL])
+        #
+        # (2) LOG-MODE of the underwater DEPTH u=-dd (the slab's location on log(u)). Ladder
+        #     ENFORCES bear DEEPER underwater than the bulls, bulls near 0: log_mode is
+        #     ordered bull < tbull < bear (deeper = larger log-depth). bull is the shallow
+        #     base; each rung adds a >=0 gap. So the slab's MEAN depth is more negative in dd
+        #     for bear than bulls (bulls ~ shallow), as required. [PRIOR+STRUCTURAL]
+        #     Priors: bull base near log(0.02) (~2% typical shallow dip when a bull IS under);
+        #     gaps ~0.7-1.0 in log space put tbull/bear progressively deeper.
+        dd_logmode_bull = numpyro.sample("dd_logmode_calm_bull", dist.Normal(jnp.log(0.02), 0.5))
+        dd_logmode_gap_tbull = numpyro.sample("dd_logmode_gap_tbull", dist.HalfNormal(0.7))
+        dd_logmode_gap_bear = numpyro.sample("dd_logmode_gap_bear", dist.HalfNormal(0.7))
+        dd_logmode_tbull = dd_logmode_bull + dd_logmode_gap_tbull
+        dd_logmode_bear = dd_logmode_tbull + dd_logmode_gap_bear
+        dd_log_mode = jnp.stack([dd_logmode_bear, dd_logmode_tbull, dd_logmode_bull])  # [BEAR,TBULL,BULL]
+        numpyro.deterministic("dd_logmode_turbulent_bull", dd_logmode_tbull)
+        numpyro.deterministic("dd_logmode_bear", dd_logmode_bear)
+        #
+        # (3) LOG-SIGMA (spread of log(u)) and NU (log-t tail dof). Per-state scale like every
+        #     other channel's ladder; nu LEARNED per state so the deep-crash tail is data-set
+        #     (nu->inf = log-Normal). Floor nu>2 for finite variance, mirroring r_t/v_t. [PRIOR]
+        dd_log_sigma = numpyro.sample("dd_log_sigma", dist.HalfNormal(1.0).expand([K]).to_event(1))
+        dd_nu = 2.0 + numpyro.sample("dd_tail_dof_raw", dist.Gamma(2.0, 0.1).expand([K]).to_event(1))
 
     # ========================================================================
     # FOURTH EMISSION CHANNEL: CREDIT-SPREAD WIDENING (cs_chg = BAA-AAA minus its value
@@ -662,7 +815,15 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
     # obs y is [r_t, v_t, dd] and the filter sums 3 log-probs (conditional independence
     # across all three -- dd is a different observable, price LEVEL not price CHANGE).
     def observation_model(x, u, t):
-        d_dist = dist.Normal(loc=dd_loc[x], scale=dd_scale) if INCLUDE_DRAWDOWN else None
+        if not INCLUDE_DRAWDOWN:
+            d_dist = None
+        elif DD_EMISSION == "hurdle_logt":
+            d_dist = _HurdleLogT(
+                atom_p=dd_atom_p[x], log_mode=dd_log_mode[x],
+                log_sigma=dd_log_sigma[x], nu=dd_nu[x],
+            )
+        else:  # "normal"
+            d_dist = dist.Normal(loc=dd_loc[x], scale=dd_scale)
         # Extra macro channels, appended in the SAME order as _OBS_COLS: credit then curve.
         extra = []
         if INCLUDE_CREDIT:

@@ -75,7 +75,15 @@ _IS_TURBULENT = jnp.array([1, 0, 1, 0])  # [turb_bear, calm_bear, turb_bull, cal
 # so BOTH bear flavors sit underwater and BOTH bull flavors ~0 -- and it reinforces the
 # calm-bear state (a calm grind is still underwater though its vol looks bull-like).
 INCLUDE_DRAWDOWN = True
-_DRAWDOWN_WINDOW_WEEKS = 52  # 1yr (sweep-chosen)
+_DRAWDOWN_WINDOW_WEEKS = 52  # 1yr; only used when _DRAWDOWN_RESET_PCT is None (trailing-window peak)
+# DRAWDOWN REFERENCE PEAK (ported from regime_model_3state 2026-08-09). None -> 52wk
+# trailing-window peak (original). 0.20 -> EVENT-RESET / cycle-peak dd: the reference holds
+# the pre-crash high through a bear and resets when price rises 20% off the trough (textbook
+# new bull), fixing the recovery lag at the source. Emission stays NORMAL (the 2x2 ablation
+# showed the hurdle emission -- correctly specified but faithful to a laggy channel -- makes
+# the nowcast LAGGIER; the Normal's mis-specification down-weights dd, which helps). See
+# data.drawdown() + [[drawdown-window-is-wrong-knob]].
+_DRAWDOWN_RESET_PCT = 0.20
 _OBS_COLS = ["r_t", "v_t", "dd"] if INCLUDE_DRAWDOWN else ["r_t", "v_t"]
 
 # PRIOR CENTERS -- round ballparks, NOT hard constants (data overrules them; see
@@ -320,11 +328,13 @@ FIT_MODE = "global"
 
 
 def obs_kwargs():
-    return dict(include_drawdown=INCLUDE_DRAWDOWN, drawdown_window_weeks=_DRAWDOWN_WINDOW_WEEKS)
+    return dict(include_drawdown=INCLUDE_DRAWDOWN, drawdown_window_weeks=_DRAWDOWN_WINDOW_WEEKS,
+                drawdown_reset_pct=_DRAWDOWN_RESET_PCT)
 
 
 def extra_spec():
-    return {"include_drawdown": INCLUDE_DRAWDOWN, "drawdown_window_weeks": _DRAWDOWN_WINDOW_WEEKS}
+    return {"include_drawdown": INCLUDE_DRAWDOWN, "drawdown_window_weeks": _DRAWDOWN_WINDOW_WEEKS,
+            "drawdown_reset_pct": _DRAWDOWN_RESET_PCT}
 
 
 def main(mode: str | None = None) -> None:

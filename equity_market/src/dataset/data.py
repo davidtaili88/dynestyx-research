@@ -180,28 +180,77 @@ class RegimeDataset:
         out.name = "inv"
         return out
 
-    def drawdown(self, window_weeks: int = 52) -> pd.Series:
-        """dd_t = weekly_price_t / (trailing max over `window_weeks`) - 1.
+    def drawdown(self, window_weeks: int = 52, reset_pct: float | None = None) -> pd.Series:
+        """dd_t = weekly_price_t / (reference peak) - 1.  Causal, price-only (NO labels).
 
-        A CAUSAL, price-only regime feature (uses NO labels / no P&S): 0 at a fresh
-        window-high, negative when below the recent peak. It carries price-LEVEL info the
-        r_t/v_t channels lack (they only see price CHANGE), which is what lets a model
-        hold P(bear) through a relief RALLY -- a rally can be +returns yet still deep
-        underwater (large negative dd), so dd says "still in a bear".
+        0 at the reference peak, negative below it. Carries price-LEVEL info the r_t/v_t
+        channels lack (they see only price CHANGE), so a model can hold P(bear) through a
+        relief RALLY (still deep underwater) rather than reacting to the +returns.
 
-        window_weeks = 52 (1yr) is the shipped default: a sweep of 1/2/3yr showed ALL
-        fix the relief-rally whipsaw, but only 1yr does so WITHOUT raising bull-market
-        false alarms (longer windows keep dd negative into early recoveries -> false
-        bear). See scratchpad/drawdown_channel.py + the [[drawdown-channel-breakthrough]]
-        memo. min_periods=1 so early weeks use the max available (still causal).
+        TWO reference-peak definitions, selected by `reset_pct`:
+
+        * reset_pct is None (default) -> TRAILING-WINDOW peak: max over the last
+          `window_weeks`. window=52 (1yr) chosen by a stability sweep (in-bear whipsaw
+          crossings halve at 52 vs 39 and plateau; see docs/drawdown_window_sweep.md). A
+          fixed calendar window has an unavoidable tension though: too long -> the peak
+          CLINGS to the pre-crash high into a recovery (dd stays negative ~9mo past the
+          bottom -> recovery false-alarm / lagging bear exit); too short -> the peak
+          RATCHETS DOWN following price through a long bear (goes blind mid-bear).
+
+        * reset_pct set (e.g. 0.20) -> EVENT-RESET peak: the reference is the max SINCE the
+          last confirmed recovery, and a recovery is CONFIRMED when price has risen
+          `reset_pct` off its trailing trough (the textbook +20% bull-market definition).
+          This DISSOLVES the window tension instead of trading it: in a bear no reset fires,
+          so the peak HOLDS the true pre-crash high for the whole decline (no ratcheting,
+          any length); at the confirmed bottom the peak RESETS to the recovery, so dd clears
+          to ~0 immediately (no calendar lag). Same "we're climbing out" signal a dd-CHANGE
+          channel tried to add, but delivered by fixing dd's REFERENCE -- so it stays ONE
+          causal channel, no conditional-independence violation. Verified on the GFC: window
+          dd stays ~-0.22 through the 2009 recovery; event-reset dd clears ~9mo sooner.
+          20% is a round, literature-standard threshold (a bull = +20% off the low), picked
+          for economic meaning, not fit to a metric -- it defines a FEATURE, not the regime;
+          the HMM still decides the state by integrating dd with r_t/v_t under learned
+          emissions and persistence, and can overrule the reset when r/v disagree.
         """
-        peak = self.weekly_price.rolling(window_weeks, min_periods=1).max()
-        dd = self.weekly_price / peak - 1.0
+        if reset_pct is None:
+            peak = self.weekly_price.rolling(window_weeks, min_periods=1).max()
+            dd = self.weekly_price / peak - 1.0
+        else:
+            dd = self._event_reset_drawdown(reset_pct)
         dd.name = "dd"
         return dd
 
+    def _event_reset_drawdown(self, reset_pct: float) -> pd.Series:
+        """Event-reset drawdown: peak HOLDS while underwater, RESETS on a +reset_pct rally
+        off the trailing trough. Causal single left-to-right pass (uses only prices up to t).
+
+        State machine: track the running `peak` (since the last reset) and the `trough`
+        beneath it. A new high extends the peak (and resets the trough to it). While below
+        the peak, deepen the trough. When price has risen `reset_pct` off that trough while
+        still under the peak, a new bull is CONFIRMED -> reset the reference peak to here.
+        dd_t = price_t / peak_t - 1.
+        """
+        p = self.weekly_price.to_numpy()
+        n = len(p)
+        dd = np.empty(n)
+        peak = p[0]
+        trough = p[0]
+        for t in range(n):
+            if p[t] > peak:                      # fresh high: extend peak, reset trough to it
+                peak = p[t]
+                trough = p[t]
+            else:                                # underwater: track the deepest point
+                trough = min(trough, p[t])
+            # confirmed recovery: +reset_pct off the trough while still below the old peak
+            if p[t] < peak and trough > 0 and (p[t] / trough - 1.0) >= reset_pct:
+                peak = p[t]                      # reset the reference to the confirmed new bull
+                trough = p[t]
+            dd[t] = p[t] / peak - 1.0
+        return pd.Series(dd, index=self.weekly_price.index)
+
     def observations(self, include_drawdown: bool = False,
                      drawdown_window_weeks: int = 52,
+                     drawdown_reset_pct: float | None = None,
                      include_credit: bool = False,
                      credit_horizon_months: int = 5,
                      include_curve: bool = False) -> pd.DataFrame:
@@ -223,7 +272,7 @@ class RegimeDataset:
         """
         cols = [self.r_t, self.v_t]
         if include_drawdown:
-            cols.append(self.drawdown(drawdown_window_weeks))
+            cols.append(self.drawdown(drawdown_window_weeks, reset_pct=drawdown_reset_pct))
         if include_credit:
             cols.append(self.credit_spread_change(credit_horizon_months))
         if include_curve:
@@ -231,13 +280,15 @@ class RegimeDataset:
         return pd.concat(cols, axis=1).dropna()
 
     def split(self, train_frac: float = 0.8, include_drawdown: bool = False,
-              drawdown_window_weeks: int = 52, include_credit: bool = False,
+              drawdown_window_weeks: int = 52, drawdown_reset_pct: float | None = None,
+              include_credit: bool = False,
               credit_horizon_months: int = 5, include_curve: bool = False,
               ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Chronological train/test split of the observation frame (section 3: genuine
         out-of-sample tail, no shuffling). Passes through all channel options."""
         obs = self.observations(include_drawdown=include_drawdown,
                                  drawdown_window_weeks=drawdown_window_weeks,
+                                 drawdown_reset_pct=drawdown_reset_pct,
                                  include_credit=include_credit,
                                  credit_horizon_months=credit_horizon_months,
                                  include_curve=include_curve)

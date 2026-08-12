@@ -94,6 +94,31 @@ MODEL_KEY = "4state"
 # ALL of these are OVERRIDABLE from the CLI (--long/--short-entry/--short-exit/
 # --short-dwell/--short-size) so the defaults are a starting point, not hard-coded.
 P_LONG = 0.60           # P(bear) below this -> long
+
+# ---- RECOVERY LEVERAGE (ported from the 3-state 2026-08-09, IDENTICAL logic + bugfix) ----
+# Lever the LONG to LEV_MULT while riding a bear's RECOVERY -- armed when a SEEN bear
+# (P>REARM_BEAR_LINE) resolves back down through LEV_ARM, held until a fresh disturbance
+# (P>LEV_DISTURB), no re-arm until a whole new bear. See the 3-state param block for the
+# full evidence (recovery-momentum edge +5.9%/yr; 1.25x is the conservative edge of a Sharpe
+# plateau -- sweep_lev_mult.py). Ported here so the 4-state strategy MATCHES the 3-state.
+LEV_MULT = 1.25
+LEV_ARM = 0.60
+REARM_BEAR_LINE = 0.90
+LEV_DISTURB = 0.25
+
+# ---- SHORT: two modes, selectable, so we can COMPARE on the 4-state's blocky curve -------
+# SHORT_MODE "momentum"    = the 3-state short: enter on the UP-CROSS of P_SHORT_MOM, exit
+#                            SHORT_PEAK_TAIL weeks after P(bear) peaks (fade the entry).
+# SHORT_MODE "persistence" = the 4-state's own short: enter after P(bear) > P_SHORT_ENTER for
+#                            SHORT_DWELL_WEEKS consecutive weeks (bear PERSISTED, not a scare),
+#                            hold while P(bear) > P_SHORT_EXIT. The 4-state's blocky P(bear)
+#                            hits ~1 on brief scares too, so the persistence gate is what kept
+#                            the dotcom/GFC edge and dropped the -104% scare bleed.
+SHORT_MODE = "persistence"   # "persistence" (4-state default) | "momentum" (3-state) | "none"
+# momentum-short params (3-state style)
+P_SHORT_MOM = 0.90      # up-cross entry line
+SHORT_PEAK_TAIL = 3     # weeks held after P(bear) first ticks down, then hard-exit
+# persistence-short params (4-state style)
 P_SHORT_ENTER = 0.97    # P(bear) above this (persistently) -> arm the short
 P_SHORT_EXIT = 0.90     # once short, cover when P(bear) falls back below this
 SHORT_DWELL_WEEKS = 13  # consecutive weeks above P_SHORT_ENTER before shorting (1 quarter)
@@ -121,7 +146,13 @@ def load_pbear(refit: bool = False):
     """
     import regime_model_3state as _base  # generic save_fit/load_fit pickle helpers
     save_fit, load_fit = _base.save_fit, _base.load_fit
-    cache_name = f"regime_{MODEL_KEY}_strategy_pbear"
+    # KEY THE CACHE TO THE DD DEFINITION so switching the drawdown reference (event-reset
+    # cycle-peak vs 52wk trailing window) auto-selects a DIFFERENT cache instead of silently
+    # serving a stale curve. event-reset dd is the SAME length as window dd, so the length
+    # check below can't catch the change on its own -- this tag is what makes the switch safe.
+    _reset = getattr(rm, "_DRAWDOWN_RESET_PCT", None)
+    _dd_tag = f"eventreset{int(_reset*100)}" if _reset is not None else "window"
+    cache_name = f"regime_{MODEL_KEY}_strategy_pbear_{_dd_tag}"
 
     ds = load_regime_dataset(start=DATA_START, include_vix=False, include_macro=False)
     kw = rm.obs_kwargs()
@@ -160,40 +191,91 @@ def load_pbear(refit: bool = False):
 # 2. Turn P(bear) into a position: long / short / hold-band / whipsaw-neutral
 # ----------------------------------------------------------------------------
 def build_positions(p_bear: pd.Series, p_long: float = P_LONG,
+                    lev_mult: float = LEV_MULT, lev_arm: float = LEV_ARM,
+                    rearm_bear_line: float = REARM_BEAR_LINE, lev_disturb: float = LEV_DISTURB,
+                    short_mode: str = SHORT_MODE,
+                    p_short_mom: float = P_SHORT_MOM, short_peak_tail: int = SHORT_PEAK_TAIL,
                     p_short_enter: float = P_SHORT_ENTER, p_short_exit: float = P_SHORT_EXIT,
                     short_dwell_weeks: int = SHORT_DWELL_WEEKS,
-                    short_size: float = SHORT_SIZE) -> pd.Series:
-    """Map the P(bear) curve to a position per week: +1 long, -short_size short, 0 flat.
+                    short_size: float = SHORT_SIZE, flat: bool = False) -> pd.Series:
+    """Map the P(bear) curve to a per-week position (causal: uses only p_bear up to t).
 
-    Stateful sweep left-to-right (using ONLY p_bear up to t -- causal):
-      * SHORT (PERSISTENCE-GATED): keep a run-length counter of consecutive weeks with
-        p_bear > p_short_enter. Enter a short only when that counter reaches
-        short_dwell_weeks (the bear has PERSISTED, not a brief scare). Once short, stay
-        short until p_bear falls back below p_short_exit, then cover. This is the fix for
-        the 4-state's false-alarm bleed -- see the module notes.
-      * LONG: if not short and p_bear < p_long -> +1.
-      * FLAT otherwise (the ambiguous middle, or a bear that hasn't persisted yet).
+    MATCHES the 3-state strategy: LONG core + RECOVERY LEVERAGE, plus a SHORT that can be
+    either the 3-state MOMENTUM short or the 4-state PERSISTENCE short (short_mode).
 
-    short_size scales the short leg (0 -> pure long/flat). Position at t is decided at
-    the t close; the backtest shifts it +1 week before applying returns (no lookahead).
+      LONG core   : +1 whenever p_bear < p_long, else 0 (flat).
+      RECOVERY LEV: raise +1 -> lev_mult during a recovery STATE (armed when a SEEN bear,
+        p>rearm_bear_line, resolves back down through lev_arm; ends on a disturbance
+        p>lev_disturb; no re-arm until a new bear). IDENTICAL logic + bugfix as the 3-state.
+      SHORT:
+        - "momentum"    : open -short_size on the UP-CROSS of p_short_mom; once p_bear first
+                          ticks DOWN (peak), hold short_peak_tail more weeks then hard-exit.
+        - "persistence" : open -short_size after p_bear > p_short_enter for short_dwell_weeks
+                          consecutive weeks; hold while p_bear > p_short_exit (the 4-state's
+                          scare-filtering gate).
+        - "none" / short_size==0 : no short.
+      The short takes priority over long/recovery while active.
+
+    flat=True short-circuits to plain long/flat. Position at t is decided at the t close;
+    the backtest shifts it +1 week before applying returns (no lookahead).
     """
     pb = p_bear.to_numpy()
     n = len(pb)
-    pos = np.zeros(n, dtype=float)
-    run = 0          # consecutive weeks with p_bear > p_short_enter
+    pos = np.where(pb < p_long, 1.0, 0.0)
+    if flat:
+        return pd.Series(pos, index=p_bear.index, name="position")
+
+    use_short = short_size > 0 and short_mode in ("momentum", "persistence")
+    in_rec = False        # riding a recovery (leverage on)
+    seen_bear = False     # a bear (p>rearm_bear_line) has occurred, not yet "used"
+    # momentum-short state
     in_short = False
-    for t in range(n):
-        run = run + 1 if pb[t] > p_short_enter else 0
-        if in_short:
-            if pb[t] < p_short_exit:   # bear resolving -> cover
+    short_peaked = False
+    since_peak = 0
+    # persistence-short state
+    run = 0               # consecutive weeks p_bear > p_short_enter
+    for t in range(1, n):
+        p, pprev = pb[t], pb[t - 1]
+
+        # ---- SHORT (takes priority over long/recovery while active) ----
+        if use_short and short_mode == "momentum":
+            if not in_short and pprev <= p_short_mom and p > p_short_mom:
+                in_short = True; short_peaked = False; since_peak = 0
+            if in_short:
+                if not short_peaked and p < pprev:
+                    short_peaked = True; since_peak = 0
+                if short_peaked:
+                    since_peak += 1
+                pos[t] = -short_size
+                if short_peaked and since_peak >= short_peak_tail:
+                    in_short = False
+                seen_bear = True; in_rec = False
+                continue
+        elif use_short and short_mode == "persistence":
+            run = run + 1 if p > p_short_enter else 0
+            if in_short and p < p_short_exit:
                 in_short = False
-        elif short_size > 0 and run >= short_dwell_weeks:
-            in_short = True            # persistence confirmed -> arm the short
-        if in_short:
-            pos[t] = -short_size
-        elif pb[t] < p_long:
-            pos[t] = 1.0
-        # else: flat (0.0)
+            elif not in_short and run >= short_dwell_weeks:
+                in_short = True
+            if in_short:
+                pos[t] = -short_size
+                seen_bear = True; in_rec = False
+                continue
+
+        # ---- RECOVERY LEVERAGE (only when not short) ----
+        if p > rearm_bear_line:
+            seen_bear = True; in_rec = False
+        armed_now = False
+        if seen_bear and not in_rec and p < lev_arm and pprev >= lev_arm:
+            in_rec = True; seen_bear = False; armed_now = True
+        # disturb exit -- but NOT on the same week we armed (3-state bugfix: a sharp recovery
+        # drops P(bear) from ~1.0 into (lev_disturb, lev_arm) in one week, and without this
+        # guard the arm fired and disarmed on the same iteration, dropping the best recoveries).
+        if in_rec and p > lev_disturb and not armed_now:
+            in_rec = False
+        if in_rec and pos[t] > 0:
+            pos[t] = lev_mult
+
     return pd.Series(pos, index=p_bear.index, name="position")
 
 
@@ -287,51 +369,81 @@ def _fmt_stats(name: str, s: dict) -> str:
 # ----------------------------------------------------------------------------
 # 4. Plot: equity curves + position/P(bear) context
 # ----------------------------------------------------------------------------
+def _pagan_sossounov_bands(index: pd.Index) -> np.ndarray | None:
+    """0/1 Pagan-Sossounov BEAR label aligned to `index` (1 = bear week), or None if the
+    labels module isn't importable. Same ground truth the nowcast plot shades (3-state twin)."""
+    try:
+        from labels import pagan_sossounov_label
+    except Exception:
+        return None
+    ds = load_regime_dataset(start=DATA_START, include_vix=False, include_macro=False)
+    lab = pagan_sossounov_label(ds.weekly_price).reindex(index).ffill()
+    return np.asarray(lab)
+
+
+def _shade_bear_bands(ax, dates, label):
+    """Shade contiguous P&S BEAR runs on `ax` (crimson, alpha=0.12) -- IDENTICAL to the
+    nowcast plot + the 3-state strategy, so all three figures' red bands line up exactly."""
+    if label is None:
+        return
+    start = 0
+    for t in range(1, len(label) + 1):
+        if t == len(label) or label[t] != label[start]:
+            if label[start] == 1:
+                ax.axvspan(dates[start], dates[t - 1], color="crimson", alpha=0.12, linewidth=0)
+            start = t
+
+
 def plot_strategy(df: pd.DataFrame, p_bear: pd.Series, save_path=None):
+    """MATCHES the 3-state strategy plot: P&S bear bands on all panels, recovery-leverage
+    shading (dark-green pos>1), short shading, same titles."""
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True,
                              height_ratios=[3, 1.0, 1.0])
     dates = df.index
+    ps_label = _pagan_sossounov_bands(dates)  # P&S BEAR ground-truth bands (shared with nowcast)
 
     ax = axes[0]
     ax.plot(dates, df["strat_equity"], color="darkgreen", lw=1.4,
             label="P(bear) long/short/neutral strategy")
     ax.plot(dates, df["bh_equity"], color="gray", lw=1.1, label="buy & hold S&P")
+    _shade_bear_bands(ax, dates, ps_label)
     ax.set_yscale("log")
     ax.set_ylabel("equity (log, start=1)")
-    ax.set_title(f"Regime P(bear) strategy vs buy & hold  [{MODEL_KEY} nowcast, channels r_t/v_t/dd]")
+    ax.set_title(f"Regime P(bear) strategy vs buy & hold  [{MODEL_KEY} nowcast, channels r_t/v_t/dd]"
+                 "\nred bands = Pagan-Sossounov BEAR (ground truth, same as the nowcast plot)")
     ax.legend(loc="upper left", fontsize=9)
 
     ax = axes[1]
     ax.plot(dates, p_bear.reindex(dates), color="darkorange", lw=1)
-    ax.axhline(P_LONG, color="green", lw=0.7, ls="--", label=f"long<{P_LONG:.0%}")
-    ax.axhline(P_SHORT_ENTER, color="red", lw=0.7, ls="--",
-               label=f"short-arm>{P_SHORT_ENTER:.0%} (after {SHORT_DWELL_WEEKS}wk)")
-    ax.axhline(P_SHORT_EXIT, color="red", lw=0.7, ls=":", label=f"short-cover<{P_SHORT_EXIT:.0%}")
+    ax.axhline(P_LONG, color="green", lw=0.7, ls="--", label=f"long/lev-arm {P_LONG:.0%}")
+    ax.axhline(LEV_DISTURB, color="seagreen", lw=0.7, ls=":", label=f"lev-disturb {LEV_DISTURB:.0%}")
+    if SHORT_MODE == "momentum":
+        ax.axhline(P_SHORT_MOM, color="red", lw=0.7, ls="--", label=f"short up-cross {P_SHORT_MOM:.0%}")
+    else:  # persistence
+        ax.axhline(P_SHORT_ENTER, color="red", lw=0.7, ls="--",
+                   label=f"short-arm>{P_SHORT_ENTER:.0%} ({SHORT_DWELL_WEEKS}wk)")
+        ax.axhline(P_SHORT_EXIT, color="red", lw=0.7, ls=":", label=f"short-cover<{P_SHORT_EXIT:.0%}")
+    _shade_bear_bands(ax, dates, ps_label)
     ax.set_ylim(-0.02, 1.02)
     ax.set_ylabel("P(bear)")
     ax.legend(loc="center left", fontsize=7, ncol=3)
 
-    # If the strategy never actually shorted, say so on the position panel (drawn next).
-    _n_short = int((df["position"] < 0).sum())
-
     ax = axes[2]
     pos = df["position"].reindex(dates)
+    ax.fill_between(dates, 0, pos.clip(upper=1.0), step="pre",
+                    where=(pos > 0), color="green", alpha=0.45, label="long (1x)")
+    ax.fill_between(dates, 1.0, pos, step="pre",
+                    where=(pos > 1.0), color="darkgreen", alpha=0.6, label=f"recovery ({LEV_MULT:g}x)")
     ax.fill_between(dates, 0, pos, step="pre",
-                    where=(pos > 0), color="green", alpha=0.5, label="long")
-    ax.fill_between(dates, 0, pos, step="pre",
-                    where=(pos < 0), color="red", alpha=0.5, label="short")
-    ax.set_ylim(-1.3, 1.3)
-    ax.set_yticks([-1, 0, 1])
+                    where=(pos < 0), color="red", alpha=0.6, label=f"short ({SHORT_SIZE:g}x)")
+    _shade_bear_bands(ax, dates, ps_label)
+    ax.set_ylim(-0.9, max(1.4, LEV_MULT + 0.15))
+    ax.set_yticks(sorted({-SHORT_SIZE, 0, 1, LEV_MULT}))
     ax.set_ylabel("position")
     ax.set_xlabel("date")
-    ax.legend(loc="upper left", fontsize=8, ncol=2)
-    if _n_short == 0:
-        ax.text(0.5, -1.05, "no short trades (SHORT_SIZE=0 or no bear persisted "
-                f"{SHORT_DWELL_WEEKS}wk) -- long/flat overlay",
-                transform=ax.get_yaxis_transform(),
-                ha="center", va="center", fontsize=7, color="red", alpha=0.8)
+    ax.legend(loc="upper left", fontsize=7, ncol=3)
 
     fig.tight_layout()
     if save_path is not None:
@@ -474,23 +586,50 @@ def main(refit: bool = False,
         print(f"\n(full grid saved -> outputs/regime_pbear_strategy_{MODEL_KEY}_sweep.csv)")
         return
 
-    positions = build_positions(p_bear, p_long=p_long, p_short_enter=p_short_enter,
-                                p_short_exit=p_short_exit, short_dwell_weeks=short_dwell_weeks,
-                                short_size=short_size)
+    # ---- COMPARE BOTH SHORTS (+ no-short) on the 4-state curve, all with the SAME long +
+    #      recovery-leverage. This answers "which short suits the blocky 4-state P(bear)". ----
+    _OOS = "2012-09-14"
+    def _score(pos):
+        d = backtest(price, r_t, pos)
+        s = performance_stats(d["strat_logret"], d["strat_equity"], positions=d["pos_traded"])
+        o = d.loc[_OOS:]
+        so = performance_stats(o["strat_logret"], o["strat_equity"])
+        return s, so
+    print("\n" + "=" * 78)
+    print(f"SHORT COMPARISON [{MODEL_KEY}]  (same long + 1.25x recovery leverage; short varies)")
+    print("=" * 78)
+    print(f"{'short mode':>24} {'Sharpe':>8} {'annRet':>8} {'maxDD':>8} {'oosShrp':>8} {'oosDD':>8} {'%short':>7}")
+    for label, mode in [("none (long/flat+lev)", "none"),
+                        ("momentum (3-state)", "momentum"),
+                        ("persistence (4-state)", "persistence")]:
+        pos = build_positions(p_bear, short_mode=mode,
+                              short_size=(0.0 if mode == "none" else short_size))
+        s, so = _score(pos)
+        print(f"{label:>24} {s['sharpe']:>8.3f} {s['ann_return']*100:>7.1f}% {s['max_drawdown']*100:>7.0f}% "
+              f"{so['sharpe']:>8.2f} {so['max_drawdown']*100:>7.0f}% {s['pct_short']*100:>6.0f}%")
+    print("=" * 78)
+
+    positions = build_positions(p_bear, short_mode=SHORT_MODE, short_size=short_size)
     df = backtest(price, r_t, positions)
     df["p_bear"] = p_bear
 
     strat = performance_stats(df["strat_logret"], df["strat_equity"], positions=df["pos_traded"])
     bh = performance_stats(df["bh_logret"], df["bh_equity"])
+    so = performance_stats(df.loc[_OOS:]["strat_logret"], df.loc[_OOS:]["strat_equity"])
+    bo = performance_stats(df.loc[_OOS:]["bh_logret"], df.loc[_OOS:]["bh_equity"])
 
-    short_note = (f"short {short_size:g}x after p>{p_short_enter:.0%} for {short_dwell_weeks}wk"
-                  if short_size > 0 else "long/flat (short OFF)")
+    short_note = (f"{SHORT_MODE} short {short_size:g}x" if short_size > 0 and SHORT_MODE != "none"
+                  else "long/flat (short OFF)")
     print("\n" + "=" * 60)
-    print(f"P(bear) STRATEGY [{MODEL_KEY}]  (long<{p_long:.0%}, {short_note})")
+    print(f"P(bear) STRATEGY [{MODEL_KEY}]  (long<{p_long:.0%} + {LEV_MULT:g}x recovery, {short_note})")
     print(f"period: {df.index[0].date()} -> {df.index[-1].date()}  ({len(df)} weekly bars)")
     print("=" * 60)
     print(_fmt_stats("STRATEGY", strat))
     print(_fmt_stats("BUY & HOLD", bh))
+    print("=" * 60)
+    print(f"  OUT-OF-SAMPLE ({_OOS} -> end, {len(df.loc[_OOS:])} wk):")
+    print(f"    strategy : Sharpe {so['sharpe']:.2f}  ann {so['ann_return']*100:.1f}%  maxDD {so['max_drawdown']*100:.0f}%")
+    print(f"    buy&hold : Sharpe {bo['sharpe']:.2f}  ann {bo['ann_return']*100:.1f}%")
     print("=" * 60)
 
     # SHORT-SIDE DIAGNOSTIC: how many persistent-bear episodes actually triggered a short,

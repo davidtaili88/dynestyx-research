@@ -5,19 +5,20 @@ Works with EITHER the 3-state (src/models/regime_model_3state.py) or the 4-state
 fit / filtered_p_bear_over interface, and in the 4-state P(bear) is the sum of both
 bear flavors (turbulent + calm). Pick with the --model CLI flag (default 3state).
 
-FINAL DESIGN (3 legs, all TRANSITION-based -- see the parameter block for the full
-evidence + anti-overfit reasoning behind every number):
-  * LONG core   : +1 when P(bear) < 0.60, else flat.
-  * RECOVERY LEV: raise the long to 1.25x while riding a bear's RECOVERY (armed when a
-                  bear resolves back under 0.60, held until P(bear) climbs back above
-                  0.25, NO re-arm until a fresh bear). "Long extra" only where it has a
-                  WHY -- recovery momentum (+14.5%/yr vs +9.2% baseline).
-  * MOMENTUM SHT: half-size short that FADES THE ENTRY into a bear (on the up-cross of
-                  0.90), held until 3 weeks after P(bear) peaks, then hard-exit -- captures
-                  the drop, exits before the recovery bounce.
-WHY TRANSITIONS not LEVELS: P(bear) is near-binary (~0 most weeks, ~1 in bears) with
-rank-corr ~0.03 to forward return in the sub-crisis range -- no gradient to size along --
-so level-based sizing was tested and REJECTED. Pass --flat to fall back to plain long/flat.
+FINAL DESIGN (2026-08-09 -- 2 legs, all TRANSITION-based; see the parameter block for the
+full evidence + anti-overfit reasoning behind every number):
+  * LONG core   : +1 when P(bear) < 0.90 (the model's BEAR LINE), else flat. Long unless
+                  the model calls an outright bear -- the one principled long/flat cutoff.
+  * RECOVERY LEV: raise the long to 1.25x while riding a bear's RECOVERY (armed when a bear
+                  resolves back down to bull-leaning, held until an early disturbance ends
+                  it, NO re-arm until a fresh bear). Recovery-momentum edge (~+6%/yr fwd).
+  * NO SHORT    : the momentum short was TESTED (5 variants) and REMOVED -- a more accurate
+                  nowcast (event-reset dd) already captures the downside by going flat in
+                  bears, so the short only added turnover + OOS drawdown. Code kept behind
+                  SHORT_SIZE=0 for reproducibility.
+WHY TRANSITIONS not LEVELS: P(bear) is near-binary (~0 most weeks, ~1 in bears; only ~1% of
+weeks land in [0.25,0.60]) -- no gradient to size along -- so level-based sizing was tested
+and REJECTED. Pass --flat to fall back to plain long/flat.
 
 NO-LOOKAHEAD CONVENTION. P(bear_t) is the CAUSAL filtered probability using data
 through week t's Friday close (the model's forward filter, filtered_p_bear_over).
@@ -73,10 +74,18 @@ from data import load_regime_dataset  # noqa: E402
 #                 exits a few weeks after P(bear) peaks -- captures the drop, not the bounce.
 #
 # ---- LONG core -------------------------------------------------------------------------
-# P_LONG=0.60: forward returns stay positive up to ~0.75; 0.60 keeps us long through the
-# rising band without flirting with the bear zone. (A calibration-table finding, robust
-# because it's a large-sample statement about the whole <0.60 mass, not a bin edge.)
-P_LONG = 0.60
+# P_LONG=0.90 (2026-08-09): stay long until P(bear) crosses the model's OWN BEAR LINE (0.90).
+# WHY 0.90 and not an arbitrary middle value: since we no longer short, the strategy is just
+# long/flat, so the long/flat cutoff should be the ONE principled probability line the model
+# already defines -- "this is a bear" = 0.90 (the same line the recovery-arm uses as REARM).
+# A middle cutoff like 0.60 is arbitrary AND noise-tripped: P(bear) routinely spikes to ~0.7
+# for a week on noise then falls back, and 0.60 needlessly flattened us through those weeks.
+# EVIDENCE: raising 0.60 -> 0.90 is a clean win -- the 59 weeks we were flat at 0.60 but long
+# at 0.90 (P(bear) in [0.60,0.90], the noise band) returned +14%/yr forward; full Sharpe
+# 0.578 -> 0.586, OOS Sharpe 0.85 -> 0.87. Cost: OOS maxDD -20% -> -23% (staying long a bit
+# deeper into a developing bear) -- net-favorable (OOS Sharpe still up, DD still << B&H's -32%).
+# So 0.90 is the principled, tested cutoff: long unless the model calls an outright bear.
+P_LONG = 0.90
 #
 # ---- RECOVERY LEVERAGE -----------------------------------------------------------------
 # MECHANISM: "longing extra units" only makes sense with a WHY. The why is RECOVERY
@@ -98,9 +107,27 @@ P_LONG = 0.60
 #     adds 1000+ levered weeks but LOWERS Sharpe (0.581->0.567) -- re-levering into a market
 #     that already showed stress is uncompensated risk. Confirmed OOS too (0.83 vs 0.79).
 LEV_MULT = 1.25
-LEV_ARM = 0.60            # recovery armed when P(bear) resolves back below this (after a bear)
+# LEV_ARM=0.60: arm the recovery once P(bear) resolves back down to BULL-LEANING territory.
+# This is a CONCEPTUAL-CLARITY choice, not a performance one: the arm line is NOT load-bearing
+# (arm 0.60 vs 0.90 both give Sharpe ~0.585 because the disturb logic decides when leverage
+# actually engages), so we pick the value with the defensible STORY. 0.60 = "arm once the model
+# is back to bull-leaning"; 0.90 would mean "start levering while the model still calls it a
+# ~90%-bear" -- indefensible to state even if it scores the same. So 0.60. Arming LOWER (0.10,
+# 'wait for full bull confirmation') was tested and is WORSE (0.573): the recovery-momentum edge
+# is front-loaded, so you must arm as it resolves, not after. REARM (0.90) is the bear line that
+# must precede a recovery.
+LEV_ARM = 0.60            # recovery armed when P(bear) resolves back to bull-leaning (conceptual clarity; not load-bearing)
 REARM_BEAR_LINE = 0.90    # "a bear" = P(bear) exceeded this (what must precede a recovery)
-LEV_DISTURB = 0.25        # recovery/leverage ends when P(bear) climbs back above this
+# LEV_DISTURB=0.25: the ONE genuinely un-derivable threshold, framed HONESTLY as a declared
+# early-exit RISK POSTURE ("pull the extra leverage at the first real sign of stress"), NOT an
+# optimum. The EARLINESS is tested-and-justified: every LATER / CONDITIONED exit is worse --
+# raising it toward the bear line rides leverage into bears (0.60 -> Sharpe 0.570); a duration
+# GRACE period (ignore early-bull spikes for ~26wk = shortest bull, then heed) is worse (0.578),
+# because some 'early chop' spikes are real continuation legs (dotcom) the early exit correctly
+# catches; whipsaw-lock / re-lever / duration-scaling all tested flat-to-worse. The exact decimal
+# is insensitive in the early band (0.25 vs 0.40 ~ same; only ~1% of weeks live in [0.25,0.60]),
+# so 0.25 is the conservative (earliest) choice in that band. Disclosed posture, not a fit.
+LEV_DISTURB = 0.25        # recovery/leverage ends when P(bear) climbs back above this (declared early-exit risk posture)
 #
 # ---- MOMENTUM SHORT --------------------------------------------------------------------
 # MECHANISM: the losing zone is the DESCENT into a bear, not any P(bear) level. Forward
@@ -118,9 +145,18 @@ LEV_DISTURB = 0.25        # recovery/leverage ends when P(bear) climbs back abov
 #   SHORT_SIZE=0.5: half unit. Full size captures a bit more raw PnL but adds enough vol to
 #     drop Sharpe BELOW the no-short baseline; half-size lands at baseline Sharpe with a
 #     small return bump. The short is a minor sweetener (~+0.4%/yr), sized so it never hurts.
+# SHORT_SIZE=0.0 (2026-08-08): the momentum short is DISABLED -- removing it is a clean win
+# on the shipped event-reset-dd + Normal curve. WITH short vs NO short (same curve, leverage
+# bugfix on): OOS Sharpe 0.78 -> 0.85, OOS maxDD -24% -> -20% (recovering/beating the original
+# -22%), OOS return 11.4% -> 13.0%, trades 155 -> 109, turnover 2.08x -> 1.53x; full-sample
+# Sharpe tied (0.576 vs 0.578). WHY the short died: a more accurate nowcast (event-reset dd)
+# resolves bears faster, so the strategy's flat-during-bear stance already captures the
+# downside -- the short just added turnover and OOS drawdown. Five variants were tested
+# (size 0.5/1.0, level-based, stop-loss, confirmation-delay); all underperformed no-short.
+# The short CODE below is kept intact (behind SHORT_SIZE) so the test stays reproducible.
 P_SHORT = 0.90
 SHORT_PEAK_TAIL = 3      # weeks to hold after P(bear) first ticks down, then hard-exit
-SHORT_SIZE = 0.5         # short position size (half unit)
+SHORT_SIZE = 0.0         # DISABLED (was 0.5) -- see the note above; no-short wins OOS
 #
 WEEKS_PER_YEAR = 52.0    # weekly (W-FRI) bars -> annualization factor
 DATA_START = "1957-03-01"  # same history the model runs are fit/evaluated on (_run_modes)
@@ -170,7 +206,14 @@ def load_pbear(model_key: str = "3state", refit: bool = False):
     expensive); pass refit=True to force a fresh fit.
     """
     mod, save_fit, load_fit, needs_macro = _load_model(model_key)
-    cache_name = f"regime_{model_key}_strategy_pbear"
+    # KEY THE CACHE TO THE EMISSION so changing the model's emission family (e.g.
+    # DD_EMISSION "normal" <-> "hurdle_logt" in regime_model_3state) auto-selects a
+    # DIFFERENT cache file instead of silently serving a stale curve fit with the old
+    # emission. Any model exposing a DD_EMISSION tag gets its own cache; models without
+    # one fall back to the plain name (unchanged behavior).
+    emission_tag = getattr(mod, "DD_EMISSION", None)
+    cache_name = (f"regime_{model_key}_strategy_pbear_{emission_tag}" if emission_tag
+                  else f"regime_{model_key}_strategy_pbear")
 
     ds = load_regime_dataset(start=DATA_START, include_vix=False,
                              include_macro=needs_macro)
@@ -275,11 +318,20 @@ def build_positions(p_bear: pd.Series, p_long: float = P_LONG,
             seen_bear = True
             in_rec = False
         # arm the recovery when a SEEN bear resolves back down through lev_arm
+        armed_now = False
         if seen_bear and not in_rec and p < lev_arm and pprev >= lev_arm:
             in_rec = True
             seen_bear = False
-        # end the recovery on a fresh disturbance
-        if in_rec and p > lev_disturb:
+            armed_now = True
+        # end the recovery on a fresh disturbance -- but NOT on the same week we just armed.
+        # BUGFIX: a SHARP recovery drops P(bear) from ~1.0 to between lev_disturb (0.25) and
+        # lev_arm (0.60) in ONE week; without the `armed_now` guard the arm fired and this
+        # disturb check disarmed it on the SAME iteration (0.45 > 0.25), so leverage never
+        # engaged. That silently dropped the fastest, strongest-momentum recoveries (1974,
+        # 2003, ...) -- exactly the ones worth levering -- and event-reset dd makes recoveries
+        # sharper, so it bit more. The disturb exit is meant for a FRESH disturbance on a
+        # LATER week, never the arming transition itself.
+        if in_rec and p > lev_disturb and not armed_now:
             in_rec = False
         if in_rec and pos[t] > 0:
             pos[t] = lev_mult
@@ -414,27 +466,62 @@ def _fmt_stats(name: str, s: dict) -> str:
 # ----------------------------------------------------------------------------
 # 4. Plot: equity curves + position/P(bear) context
 # ----------------------------------------------------------------------------
+def _pagan_sossounov_bands(index: pd.Index) -> np.ndarray | None:
+    """0/1 Pagan-Sossounov BEAR label aligned to `index` (1 = bear week), or None if
+    the labels module isn't importable. Same ground truth the nowcast plot shades."""
+    try:
+        from labels import pagan_sossounov_label
+    except Exception:
+        return None
+    ds = load_regime_dataset(start=DATA_START, include_vix=False, include_macro=False)
+    lab = pagan_sossounov_label(ds.weekly_price).reindex(index).ffill()
+    return np.asarray(lab)
+
+
+def _shade_bear_bands(ax, dates, label):
+    """Shade contiguous P&S BEAR runs on `ax` -- IDENTICAL style to the nowcast plot
+    (regime_model_3state.plot_regime_fit: crimson, alpha=0.12) so the two figures'
+    red bands line up exactly."""
+    if label is None:
+        return
+    start = 0
+    for t in range(1, len(label) + 1):
+        if t == len(label) or label[t] != label[start]:
+            if label[start] == 1:  # BEAR run
+                ax.axvspan(dates[start], dates[t - 1], color="crimson", alpha=0.12, linewidth=0)
+            start = t
+
+
 def plot_strategy(df: pd.DataFrame, p_bear: pd.Series, save_path=None, model_key: str = "3state"):
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True,
                              height_ratios=[3, 1.0, 1.0])
     dates = df.index
+    ps_label = _pagan_sossounov_bands(dates)  # P&S BEAR ground-truth bands (shared with nowcast)
 
     ax = axes[0]
-    ax.plot(dates, df["strat_equity"], color="darkgreen", lw=1.4,
-            label="P(bear) long/short/neutral strategy")
+    _has_short = SHORT_SIZE > 0 and (df["position"] < 0).any()
+    _strat_label = ("P(bear) long/flat + recovery-leverage strategy" if not _has_short
+                    else "P(bear) long/short/flat strategy")
+    ax.plot(dates, df["strat_equity"], color="darkgreen", lw=1.4, label=_strat_label)
     ax.plot(dates, df["bh_equity"], color="gray", lw=1.1, label="buy & hold S&P")
+    _shade_bear_bands(ax, dates, ps_label)  # red = Pagan-Sossounov BEAR (same as nowcast)
     ax.set_yscale("log")
     ax.set_ylabel("equity (log, start=1)")
-    ax.set_title(f"Regime P(bear) strategy vs buy & hold  [{model_key} nowcast, channels r_t/v_t/dd]")
+    ax.set_title(f"Regime P(bear) strategy vs buy & hold  [{model_key} nowcast, channels r_t/v_t/dd]"
+                 "\nlong < 90% (bear line) + 1.25x recovery leverage, no short   |   "
+                 "red bands = Pagan-Sossounov BEAR")
     ax.legend(loc="upper left", fontsize=9)
 
     ax = axes[1]
     ax.plot(dates, p_bear.reindex(dates), color="darkorange", lw=1)
-    ax.axhline(P_LONG, color="green", lw=0.7, ls="--", label=f"long/lev-arm {P_LONG:.0%}")
-    ax.axhline(LEV_DISTURB, color="seagreen", lw=0.7, ls=":", label=f"lev-disturb {LEV_DISTURB:.0%}")
-    ax.axhline(P_SHORT, color="red", lw=0.7, ls="--", label=f"short up-cross {P_SHORT:.0%}")
+    ax.axhline(P_LONG, color="red", lw=0.8, ls="--", label=f"long/flat cutoff {P_LONG:.0%} (bear line)")
+    ax.axhline(LEV_ARM, color="green", lw=0.7, ls="--", label=f"lev-arm {LEV_ARM:.0%} (bull-leaning)")
+    ax.axhline(LEV_DISTURB, color="seagreen", lw=0.7, ls=":", label=f"lev-disturb {LEV_DISTURB:.0%} (early exit)")
+    if SHORT_SIZE > 0:  # only drawn if the short is actually enabled
+        ax.axhline(P_SHORT, color="firebrick", lw=0.7, ls="-.", label=f"short up-cross {P_SHORT:.0%}")
+    _shade_bear_bands(ax, dates, ps_label)  # P&S BEAR bands behind the P(bear) curve
     ax.set_ylim(-0.02, 1.02)
     ax.set_ylabel("P(bear)")
     ax.legend(loc="center left", fontsize=7, ncol=3)
@@ -447,10 +534,14 @@ def plot_strategy(df: pd.DataFrame, p_bear: pd.Series, save_path=None, model_key
                     where=(pos > 0), color="green", alpha=0.45, label="long (1x)")
     ax.fill_between(dates, 1.0, pos, step="pre",
                     where=(pos > 1.0), color="darkgreen", alpha=0.6, label=f"recovery ({LEV_MULT:g}x)")
-    ax.fill_between(dates, 0, pos, step="pre",
-                    where=(pos < 0), color="red", alpha=0.6, label=f"short ({SHORT_SIZE:g}x)")
-    ax.set_ylim(-0.9, max(1.4, LEV_MULT + 0.15))
-    ax.set_yticks(sorted({-SHORT_SIZE, 0, 1, LEV_MULT}))
+    yticks = {0, 1, LEV_MULT}
+    if SHORT_SIZE > 0 and (pos < 0).any():   # only draw/label the short if it's actually used
+        ax.fill_between(dates, 0, pos, step="pre",
+                        where=(pos < 0), color="red", alpha=0.6, label=f"short ({SHORT_SIZE:g}x)")
+        yticks.add(-SHORT_SIZE)
+    _shade_bear_bands(ax, dates, ps_label)  # P&S BEAR bands behind the position track
+    ax.set_ylim((-0.9 if SHORT_SIZE > 0 else -0.15), max(1.4, LEV_MULT + 0.15))
+    ax.set_yticks(sorted(yticks))
     ax.set_ylabel("position")
     ax.set_xlabel("date")
     ax.legend(loc="upper left", fontsize=7, ncol=3)
@@ -572,9 +663,11 @@ def main(model_key: str = "3state", refit: bool = False, flat: bool = False,
 
     cost_desc = (f"  (net of {cost_per_turn*1e4:.1f} bps/unit-turnover transaction costs)"
                  if cost_per_turn > 0 else "  (frictionless -- pass --cost-bps N for costs)")
+    _short_desc = (f" + {SHORT_SIZE:g}x momentum short (up-cross {P_SHORT:.0%}, peak+{SHORT_PEAK_TAIL}wk)"
+                   if SHORT_SIZE > 0 else "  [short OFF]")
     desc = ("PLAIN long/flat (baseline)" if flat else
-            f"long/flat<{P_LONG:.0%} + {LEV_MULT:g}x recovery (arm {P_LONG:.0%}, disturb {LEV_DISTURB:.0%}, "
-            f"no re-arm) + {SHORT_SIZE:g}x momentum short (up-cross {P_SHORT:.0%}, peak+{SHORT_PEAK_TAIL}wk)")
+            f"long/flat<{P_LONG:.0%} (bear line) + {LEV_MULT:g}x recovery "
+            f"(arm {LEV_ARM:.0%}, disturb {LEV_DISTURB:.0%}, no re-arm){_short_desc}")
     print("\n" + "=" * 68)
     print(f"P(bear) STRATEGY [{model_key}]")
     print(f"  {desc}")
