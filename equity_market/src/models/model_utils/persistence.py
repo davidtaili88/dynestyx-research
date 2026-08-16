@@ -1,19 +1,21 @@
-"""Shared run-output persistence for the regime models.
+"""Persistence for the regime models: save/load run records and cached fits.
 
-Every model's main() calls save_run(...) right before plotting, so each fit's
-P(bear) curve, ground-truth labels, dates, and a SPEC of exactly what model /
-channels produced it land in equity_market/outputs/ automatically. This means a run
-is reproducible-from-disk (reload the pkl, re-plot, or diff two models) without
-re-running the ~8-minute NUTS fit.
+Two families, both writing to equity_market/outputs/ (git-ignored -> local artifacts):
+
+  * save_run / load_run  -- a full model RUN record: the P(bear) curve, labels, dates and a
+    self-describing spec (model, channels, metrics). Called by fit_mode_processor after each
+    fit so a run is reproducible-from-disk without re-running the ~8-minute NUTS fit.
+  * save_fit / load_fit  -- a lighter CACHE of a fit's posterior samples (+ optional extras
+    like the P(bear) curve), used by the trading strategy / sweeps to skip a refit. These are
+    MODEL-AGNOSTIC pickle helpers: obs_cols is passed IN (not read from a model module), so
+    nothing has to import a specific model just to persist a fit.
 
 Layout in outputs/:
   <run_name>.pkl   -- pickled dict (arrays + spec), the machine-readable record
   <run_name>.json  -- the spec ALONE, human-readable (open it to see what ran)
-  runs_index.jsonl -- one line appended per save: {name, model, timestamp, metrics}
-                      so `outputs/` is self-describing at a glance.
+  runs_index.jsonl -- one line appended per save_run: {name, model, timestamp, metrics}
 
-`outputs/` is git-ignored (see .gitignore: outputs/, *.pkl), so these are local
-artifacts, never committed.
+Metrics used in the run spec come from metrics.py (the shared yardstick).
 """
 
 from __future__ import annotations
@@ -24,43 +26,9 @@ import pathlib as _pathlib
 
 import numpy as _np
 
-_OUTPUTS_DIR = _pathlib.Path(__file__).resolve().parents[2] / "outputs"
+from metrics import _standard_metrics
 
-
-def _crossings(p_bear, idx, lo, hi=None):
-    """Count 0.5-threshold sign flips of P(bear) in [lo, hi] -- the whipsaw proxy."""
-    import pandas as pd
-
-    s = pd.Series(_np.asarray(p_bear), index=idx)
-    s = s.loc[lo:hi] if hi is not None else s.loc[lo:]
-    if len(s) < 2:
-        return 0
-    b = (s.values > 0.5).astype(int)
-    return int(_np.abs(_np.diff(b)).sum())
-
-
-def _standard_metrics(p_bear, idx, label):
-    """The same yardstick used across experiments: whipsaw crossings (total + the
-    dotcom and 1970s windows) plus recall / false-alarm. Computed only where the
-    label is available; windows outside the data just return 0 crossings.
-    """
-    p = _np.asarray(p_bear, dtype=float)
-    lab = _np.asarray(label, dtype=float)
-    is_bear = lab == 1
-    is_bull = lab == 0
-    start = idx[0]
-    m = {
-        "cx_total": _crossings(p, idx, start),
-        "cx_dotcom": _crossings(p, idx, "2000-01-01", "2003-06-30"),
-        "cx_1970s": _crossings(p, idx, "1970-01-01", "1983-01-01"),
-        # recall here = mean P(bear) over true-bear weeks (soft recall); false-alarm =
-        # mean P(bear) over true-bull weeks. Read the two TOGETHER (see the metric note
-        # in the model docs): a whipsaw drop that also tanks recall is not a real fix.
-        "recall": float(p[is_bear].mean()) if is_bear.any() else float("nan"),
-        "false_alarm": float(p[is_bull].mean()) if is_bull.any() else float("nan"),
-        "n_weeks": int(len(p)),
-    }
-    return m
+_OUTPUTS_DIR = _pathlib.Path(__file__).resolve().parents[3] / "outputs"
 
 
 def save_run(
@@ -78,10 +46,10 @@ def save_run(
     """Persist one model run's output + a self-describing spec to outputs/.
 
     Args:
-      run_name   : file stem, e.g. "regime_3state_rvdd_credit_curve". Overwrites
+      run_name   : file stem, e.g. "regime_3state_strategy_pbear". Overwrites
                    same-named prior runs (so re-running a model refreshes its record).
       model      : which model module produced this, e.g. "regime_model_3state".
-      obs_cols   : the emission channels used, e.g. ["r_t","v_t","dd","cs_chg","inv"]
+      obs_cols   : the emission channels used, e.g. ["r_t","v_t","dd"]
                    -- THE key part of the spec (what information the fit saw).
       dates      : the weekly DatetimeIndex for p_bear / label (one value per week).
       p_bear     : posterior-averaged filtered P(bear) array.
@@ -157,4 +125,42 @@ def load_run(run_name: str) -> dict:
     import pickle
 
     with open(_OUTPUTS_DIR / f"{run_name}.pkl", "rb") as fh:
+        return pickle.load(fh)
+
+
+def save_fit(mcmc, name: str, obs_cols, extra: dict | None = None) -> _pathlib.Path:
+    """Persist a fitted model's POSTERIOR SAMPLES (+ optional extras) to outputs/<name>.pkl
+    so it can be reloaded without a fresh NUTS run.
+
+    MODEL-AGNOSTIC: obs_cols (the channels the fit used) is passed IN, not read from a model
+    module -- so any caller can cache a fit without importing a specific model. We save
+    mcmc.get_samples() (a plain dict of numpy/jax arrays, incl. the recorded
+    f_filtered_states) rather than the live MCMC object -- portable and reload-safe. `extra`
+    can carry the channel config / P(bear) curve / dates so a saved fit is self-describing.
+    Returns the written path.
+    """
+    import pickle
+
+    _OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    samples = {k: _np.asarray(v) for k, v in mcmc.get_samples().items()}
+    payload = {"samples": samples, "obs_cols": list(obs_cols)}
+    if extra:
+        payload["extra"] = extra
+    path = _OUTPUTS_DIR / f"{name}.pkl"
+    with open(path, "wb") as fh:
+        pickle.dump(payload, fh)
+    return path
+
+
+def load_fit(name: str) -> dict:
+    """Reload a fit saved by save_fit -> {"samples": {...}, "obs_cols": [...], ...}.
+
+    The returned "samples" dict can be fed to filtered_p_bear_over via a thin Predictive
+    wrapper, or inspected directly for posterior parameter values. Raises FileNotFoundError
+    if outputs/<name>.pkl is absent (nothing cached yet).
+    """
+    import pickle
+
+    path = _OUTPUTS_DIR / f"{name}.pkl"
+    with open(path, "rb") as fh:
         return pickle.load(fh)

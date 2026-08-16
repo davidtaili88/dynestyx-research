@@ -1,6 +1,5 @@
-"""Bayesian regime nowcast (spec sections 2, 5, 6): 3-STATE discrete-time HMM
-fit with dynestyx/NumPyro, BIVARIATE emission on (r_t, v_t): weekly log return
-and log intra-week realized vol.
+"""Bayesian regime nowcast: 3-STATE discrete-time HMM fit with dynestyx/NumPyro,
+BIVARIATE emission on (r_t, v_t): weekly log return and log intra-week realized vol.
 
 This is the 3-state variant. Its 2-state predecessor lives in
 regime_model_2state.py; the third state (TURBULENT_BULL) was added to fix the
@@ -11,7 +10,18 @@ constants and regime_model() docstring for the full rationale.
 Follows the notebooks/07_hidden_markov_model.ipynb pattern (Categorical
 state_evolution driven by a learned transition matrix, Filter(HMMConfig())
 + NUTS), swapped from a toy categorical emission to a per-state Student-t
-emission on r_t, with priors from section 5 instead of a flat Dirichlet.
+emission on r_t, with empirically-grounded priors instead of a flat Dirichlet.
+
+SINGLE SOURCE OF TRUTH FOR P(bear): running this file (the default 'global' mode)
+refits and writes the SHARED P(bear) cache that every downstream consumer reads --
+the trading strategy and the parameter sweeps all load the GLOBAL curve via
+regime_pbear_strategy.load_pbear (cache regime_3state_strategy_pbear_<emission>.pkl).
+So to refresh P(bear) everywhere, just run:
+    python src/models/regime_model_3state.py            # -> global curve (canonical)
+    python src/models/regime_model_3state.py walkforward # -> *_walkforward curve (extra)
+Walk-forward is cached under a separate *_walkforward name and is NOT what the
+strategy/sweeps read by default -- they consume the GLOBAL fit. See
+fit_mode_processor._write_strategy_cache / _strategy_cache_name.
 """
 
 from __future__ import annotations
@@ -50,13 +60,13 @@ K = 3
 # recall (see the big note in regime_model and [[drawdown-channel-breakthrough]]). Set
 # False to recover the original 2-channel [r_t, v_t] model (fit/filter auto-adapt).
 INCLUDE_DRAWDOWN = True
-_DRAWDOWN_WINDOW_WEEKS = 52  # 1yr; only used when _DRAWDOWN_RESET_PCT is None (trailing-window peak)
-# DRAWDOWN REFERENCE PEAK. None -> 52wk TRAILING-WINDOW peak (original). A float (e.g. 0.20)
-# -> EVENT-RESET peak: reference holds the pre-crash high through a bear, resets when price
-# rises reset_pct off the trough (a confirmed +20% recovery = textbook new bull). Fixes the
-# recovery LAG / false-alarm at the SOURCE (dd clears ~9mo sooner in a recovery) without a
-# 2nd channel -- see data.drawdown() + [[drawdown-window-is-wrong-knob]]. 0.20 is the round
-# literature threshold, defines a FEATURE not the regime (the HMM still decides the state).
+# DRAWDOWN REFERENCE PEAK = EVENT-RESET: the reference holds the pre-crash high through a
+# bear, and resets when price rises _DRAWDOWN_RESET_PCT off the trough (a confirmed +20%
+# recovery = textbook new bull). Fixes the recovery LAG / false-alarm at the SOURCE (dd
+# clears ~9mo sooner in a recovery) without a 2nd channel -- see data_acquisition.drawdown() +
+# [[drawdown-window-is-wrong-knob]]. 0.20 is the round literature threshold; it defines a
+# FEATURE not the regime (the HMM still decides the state). (The old fixed trailing-window
+# peak was dropped -- the window had no good setting; event-reset dissolves that tension.)
 _DRAWDOWN_RESET_PCT = 0.20
 
 # DRAWDOWN EMISSION FAMILY. dd = price/peak - 1 is HARD-BOUNDED at 0 with a LITERAL point
@@ -71,8 +81,8 @@ _DRAWDOWN_RESET_PCT = 0.20
 # weight is LEARNED per state (nu), like the r_t/v_t channels; nu->inf recovers log-Normal.
 # All three hurdle quantities are per-state ORDERED LADDERS (bear<tbull<bull for atom-p and
 # for the log-mode), so the calm>turbulent>bear ordering is imposed as STRUCTURE, not fit
-# from the label-less middle rung. See the emission block + diagnostics/drawdown_emission_shape.py
-# and diagnostics/drawdown_peak_tracking.py. "normal" keeps the original Normal for A/B + OOS.
+# from the label-less middle rung. See the emission block + diagnostics/drawdown_emission_shape.py.
+# "normal" keeps the original Normal for A/B + OOS.
 DD_EMISSION = "normal"   # "normal" (SHIPPED) | "hurdle_logt" (better-specified but WORSE nowcast)
 # EMISSION CHOICE (2026-08-08, decided by a 2x2 ablation over {window,event-reset} dd x
 # {normal,hurdle_logt} emission). The hurdle+log-t is the CORRECTLY-SPECIFIED family (dd is
@@ -86,52 +96,27 @@ DD_EMISSION = "normal"   # "normal" (SHIPPED) | "hurdle_logt" (better-specified 
 # nowcast quality is. We ship the simpler Normal. The event-reset dd (cycle-peak, +20% reset)
 # is KEPT -- the same ablation showed it's neutral-to-good (best recFA 0.200, lag ~flat).
 
-# MACRO CHANNELS (two, COMPLEMENTARY BY ERA -- both target the residual mid-bear whipsaw
-# in slow/rolling-top bears that dd alone doesn't fully damp; see the emission blocks):
-#   INCLUDE_CREDIT: BAA-AAA multi-month WIDENING (cs_chg). Strong in DEFAULT-driven bears
-#     (dotcom, GFC, post-2010), DEAD in the rate-driven 1970-82 stagflation bears.
-#   INCLUDE_CURVE : yield-curve INVERSION DEPTH (inv = max(0, 3m-10y)). Strong exactly
-#     where credit is dead (1970-82, +0.74sd), silent in default-driven bears.
-# corr(cs_chg, inv) ~ 0.05: independent signals -> the two together span both bear TYPES.
-# Both need the macro CSVs -> load_regime_dataset(..., include_macro=True). Off would
-# recover the 3-channel [r,v,dd] model. See data.py credit_spread_change / curve_inversion.
-# CREDIT is OFF by default (2026-07-27). The episode-level analysis showed credit alone is
-# a net LIABILITY under the global fit: its bull-signal in the calm ~80% of history swamps
-# the price channels and VETOES bear calls almost everywhere (bear recall 0.42 -> 0.08). Its
-# bear-signal only appears in a few default-driven bears, so a single global bull/bear gap
-# averages to a suppressor. CURVE (inversion depth) does the useful work on its own -- it
-# CONFIRMS default bears (dotcom 0.63->0.75, GFC 0.52->0.82) AND covers the rate-driven
-# 1970s bears -- so we ship dd+curve. Credit is left toggleable pending a WALK-FORWARD test
-# (per-era refit is where credit is expected to stop being a global suppressor).
+# (Macro leading-indicator channels -- credit-spread widening + yield-curve inversion --
+# were explored here and NOT shipped; removed 2026-08-16 for a clean price-only model.
+# See docs/unused_ideas/macro_leading_indicators.md for the idea and its era-complementarity
+# rationale. This model ships the 3 price channels: r_t, v_t, dd.)
 
 
-INCLUDE_CREDIT = False
-_CREDIT_HORIZON_MONTHS = 5   # peak of a broad 3-8mo plateau in the separation sweep (not overfit)
-INCLUDE_CURVE = False
-print(INCLUDE_CREDIT, INCLUDE_CURVE)
 # Observation column order MUST match this everywhere (fit, filter, _JointRV indexing).
-# Order: r_t, v_t, then dd, then cs_chg, then inv -- append-only so earlier
-# channels' indices never shift (mirrors observations() append order in data.py).
+# Order: r_t, v_t, then dd -- append-only so earlier channels' indices never shift
+# (mirrors observations() append order in data_acquisition.py).
 _OBS_COLS = ["r_t", "v_t"]
 if INCLUDE_DRAWDOWN:
     _OBS_COLS.append("dd")
-if INCLUDE_CREDIT:
-    _OBS_COLS.append("cs_chg")
-if INCLUDE_CURVE:
-    _OBS_COLS.append("inv")
 
 # One place that maps the module toggles to the data-layer channel kwargs, so every
 # observations()/split() call site stays consistent with _OBS_COLS above.
 _OBS_KWARGS = dict(
     include_drawdown=INCLUDE_DRAWDOWN,
-    drawdown_window_weeks=_DRAWDOWN_WINDOW_WEEKS,
     drawdown_reset_pct=_DRAWDOWN_RESET_PCT,
-    include_credit=INCLUDE_CREDIT,
-    credit_horizon_months=_CREDIT_HORIZON_MONTHS,
-    include_curve=INCLUDE_CURVE,
 )
-# Whether any channel needs the macro CSVs loaded (credit/curve do; dd/r/v don't).
-_NEEDS_MACRO = INCLUDE_CREDIT or INCLUDE_CURVE
+# No channel needs the macro CSVs (price-only model); kept for the fit_mode_processor interface.
+_NEEDS_MACRO = False
 
 # DEFAULT fit mode when you run the file with no CLI arg:
 #   "global"      -> one 80/20 fit; fast; train/test generalization.
@@ -156,14 +141,17 @@ FIT_MODE = "global"
 # PRIOR CENTERS for the drift channel -- NOT hard constants the model uses; they are
 # the LOCATIONS at which the learnable drift priors are centered (the model learns the
 # actual values around them). DELIBERATELY ROUND BALLPARKS, not precise fitted numbers:
-# a prior-sensitivity check (scratchpad/prior_sensitivity.py) showed the data tightens
-# every one of these posteriors to <=18% (usually <7%) of its prior width, i.e. the
-# likelihood overrules the center 5-50x -- so the EXACT value is inert. We therefore use
-# round, obviously-approximate values (and center bear drift at 0, NOT presupposing a
-# sign) rather than frozen digits from an old sklearn baseline, which merely LOOKED
-# overfitted. (Named _PRIOR_ not _EMPIRICAL_ because these are prior centers, not
-# measured constants the model is forced to use.)
-_PRIOR_BEAR_DRIFT_MEAN = 0.0     # neutral center; data pulls it negative on its own
+# the inertness screen (param_analysis/prior_analysis.py prior_sensitivity) shows the data
+# tightens these posteriors 5-50x, so the EXACT center is inert. We use round, obviously-
+# approximate values rather than frozen digits from an old sklearn baseline.
+# BEAR DRIFT is centered NEGATIVE, not at 0: a bear is DEFINED by negative drift, so the
+# sign is STRUCTURE and belongs in the prior (structure/signs go in priors; magnitudes are
+# learned). The prior is wide enough (sd 0.01) to reach 0, so the data can pull it toward 0
+# if it disagrees -- but we don't decline to state what "bear" means. (Since the drift
+# LADDER ordering is already imposed by non-negative drift_gap HalfNormals, this sign prior
+# is not needed for identification -- it's a structural statement, freely made because inert.)
+# (Named _PRIOR_ not _EMPIRICAL_ -- prior centers, not measured constants the model must use.)
+_PRIOR_BEAR_DRIFT_MEAN = -0.005  # bear = negative drift (structural); wide enough to reach 0
 _PRIOR_DRIFT_GAP = 0.005         # round ballpark for the bull-vs-bear weekly drift gap
                                  # (~0.5%/wk); only sets the DRIFT-LADDER gap prior scale
 
@@ -172,7 +160,7 @@ _PRIOR_DRIFT_GAP = 0.005         # round ballpark for the bull-vs-bear weekly dr
 # ballparks for where calm vs turbulent log-vol sit and how far apart:
 #   calm (bull-leaning, low vol)      log-vol ~ -5.3
 #   turbulent (bear-leaning, high vol) log-vol ~ -4.3   -> calm->turbulent gap ~ 1.0
-# NOTE: v_t is already log(realized_vol) (data.py), so these are on the log scale.
+# NOTE: v_t is already log(realized_vol) (data_acquisition.py), so these are on the log scale.
 _PRIOR_CALM_LOG_VOL_MEAN = -5.3   # bull-leaning (low intra-week realized vol), rounded
 _PRIOR_LOG_VOL_GAP = 1.0          # round calm->turbulent log-vol gap (~ -4.3 minus -5.3)
 _PRIOR_LOG_VOL_SPREAD = 0.4   # typical within-group spread of v_t
@@ -209,8 +197,8 @@ class _JointRV(dist.Distribution):
     def __init__(self, r_dist, v_dist, d_dist=None, extra_dists=()):
         # r_dist, v_dist are the always-present [r_t, v_t] channels. d_dist is the
         # OPTIONAL drawdown channel (kept as a named arg for back-compat). extra_dists
-        # is an ordered tuple of ANY FURTHER conditionally-independent channels
-        # (credit cs_chg, curve inv, ...). The event is the concatenation
+        # is an ordered tuple of ANY FURTHER conditionally-independent channels (a general
+        # hook; currently unused). The event is the concatenation
         # [r_t, v_t, (dd,) *extras] and log_prob returns the per-dim vector the filter
         # SUMS -- conditional independence extends to K channels identically.
         self.r_dist = r_dist
@@ -489,7 +477,7 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
     # SECOND EMISSION DIMENSION: v_t = observed LOG intra-week realized vol.
     # DECISION / definition, and how it differs from return_vols above:
     #   * v_t is OBSERVED DATA (computed once per week: log-std of that week's
-    #     ~5 daily returns, data.py's weekly_log_realized_vol). return_vols was
+    #     ~5 daily returns, data_acquisition.py's weekly_log_realized_vol). return_vols was
     #     an INFERRED scale parameter of the r_t distribution. Different objects,
     #     different observables -- so this is a genuine extra channel, not a
     #     reparameterization of the return volatility.
@@ -632,7 +620,14 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
     # [STRUCTURAL] the ordered 2-level assignment. -> [PRIOR+STRUCTURAL].
     # ========================================================================
     if INCLUDE_DRAWDOWN and DD_EMISSION == "normal":
-        dd_bull = numpyro.sample("dd_bull", dist.Normal(0.0, 0.05))         # bull: ~0 (near peak)
+        # dd_bull is the LOCATION of bull-state dd. dd = price/peak - 1 lives in (-inf, 0]
+        # (0 at the peak, negative underwater), so bull's center is AT/JUST-BELOW 0 -- never
+        # above it. We therefore give dd_bull the correct one-sided support via a NEGATED
+        # HalfNormal (dd_bull = -HalfNormal <= 0), not a two-sided Normal that would leak
+        # prior mass into the impossible dd>0 region. Mode at 0 (bull ~ at peak), tail
+        # reaching slightly negative (bulls sit a touch underwater on minor pullbacks;
+        # posterior ~ -0.024). [PRIOR] the scale; [STRUCTURAL] the <=0 support.
+        dd_bull = -numpyro.sample("dd_bull_depth", dist.HalfNormal(0.05))   # bull: <=0, ~at peak
         dd_bear_gap = numpyro.sample("dd_bear_gap", dist.HalfNormal(0.20))  # how far underwater bear is
         dd_tbull_gap = numpyro.sample("dd_tbull_gap", dist.HalfNormal(0.10))  # tbull mildly underwater
         dd_loc = jnp.stack([dd_bull - dd_bear_gap, dd_bull - dd_tbull_gap, dd_bull])  # [BEAR,TBULL,BULL]
@@ -684,60 +679,9 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
         dd_log_sigma = numpyro.sample("dd_log_sigma", dist.HalfNormal(1.0).expand([K]).to_event(1))
         dd_nu = 2.0 + numpyro.sample("dd_tail_dof_raw", dist.Gamma(2.0, 0.1).expand([K]).to_event(1))
 
-    # ========================================================================
-    # FOURTH EMISSION CHANNEL: CREDIT-SPREAD WIDENING (cs_chg = BAA-AAA minus its value
-    # _CREDIT_HORIZON_MONTHS ago). ENABLED by INCLUDE_CREDIT. Targets the residual
-    # mid-bear whipsaw in DEFAULT-driven bears (dotcom, GFC) that dd alone under-damps:
-    # the spread keeps WIDENING through the bear even on relief-rally weeks (a level dd
-    # can drift back toward 0 on), so cs_chg holds the bear when price momentarily doesn't.
-    #   SEPARATION: ~+0.5sd on true bears, ~0 corr with r/v/dd (NEW info, not re-encoded
-    #   price -- the bar dd had to clear). The LEVEL was blind at onset (~-0.09sd); the
-    #   multi-month CHANGE carries the signal (spreads widen AS the bear develops).
-    #   ERA CAVEAT: strong in default-driven bears, ~DEAD in the rate-driven 1970-82
-    #   stagflation bears -- that era is covered by the curve-inversion channel instead
-    #   (the two are complementary by era; see INCLUDE_CURVE). So under a single GLOBAL
-    #   fit cs_chg's bear/bull gap is a blend the 1970s drags toward 0; it is most
-    #   effective under the walk-forward fit, where a dotcom fold learns a strong gap and
-    #   a 1970s fold learns ~none (same non-stationarity logic as walk_forward_p_bear).
-    # STRUCTURE: 2-LEVEL ladder -- BEAR widening (cs_chg_bear = base + bear_gap > 0),
-    # BULL ~0 (stable/tightening), TBULL mildly widening. Normal emission (cs_chg is a
-    # roughly-symmetric monthly difference). [PRIOR] cs_base, cs_bear_gap, cs_tbull_gap,
-    # cs_scale; [STRUCTURAL] the ordered assignment. -> [PRIOR+STRUCTURAL].
-    # ========================================================================
-    if INCLUDE_CREDIT:
-        cs_base = numpyro.sample("cs_base", dist.Normal(0.0, 0.05))          # bull: ~0 (stable spread)
-        cs_bear_gap = numpyro.sample("cs_bear_gap", dist.HalfNormal(0.30))   # bear: spread WIDENING (>0)
-        cs_tbull_gap = numpyro.sample("cs_tbull_gap", dist.HalfNormal(0.15))  # tbull: mild widening
-        cs_loc = jnp.stack([cs_base + cs_bear_gap, cs_base + cs_tbull_gap, cs_base])  # [BEAR,TBULL,BULL]
-        cs_scale = numpyro.sample("cs_scale", dist.HalfNormal(0.25))
-
-    # ========================================================================
-    # FIFTH EMISSION CHANNEL: YIELD-CURVE INVERSION DEPTH (inv = max(0, 3m-10y), 0 when
-    # the curve is normal). ENABLED by INCLUDE_CURVE. This is the COMPLEMENT to credit:
-    # it carries bear signal exactly in the RATE-driven 1970-82 bears where credit is
-    # dead (+0.74sd there), and is ~silent (inv=0) in the default-driven bears credit
-    # covers. corr(cs_chg, inv) ~ 0.05: independent, so together they span both bear TYPES.
-    #   WHY ONE-SIDED (depth, not slope): the raw slope level / change FLIP SIGN across
-    #   eras (unusable as a global mean); clamping to inversion DEPTH keeps only the half
-    #   that consistently means stress -- non-negative-signed wherever it fires, silent
-    #   otherwise. The equity tell is the inversion itself, not the level (validated by era).
-    #   LIMITATION (accepted): inv fires at/before a rate-driven top then FADES once the
-    #   Fed cuts and the curve re-steepens mid-bear -- an early pulse, not a sustained hold
-    #   (pure depth, no decay memory, is the version validated). It carries the rate-driven
-    #   ONSET; credit / dd carry the body.
-    # STRUCTURE: 2-LEVEL ladder -- BEAR inverted (inv_bear = inv_base + bear_gap > 0),
-    # BULL ~0 (normal curve), TBULL mildly inverted. HalfNormal-gap ladder like the others.
-    # NOTE inv >= 0 by construction, so a Normal emission puts a little mass below 0; that
-    # is fine (it is just the calm-state noise floor around inv=0) and matches how dd's
-    # Normal handles its bounded-at-0 top. [PRIOR] inv_base, inv_bear_gap, inv_tbull_gap,
-    # inv_scale; [STRUCTURAL] the ordered assignment. -> [PRIOR+STRUCTURAL].
-    # ========================================================================
-    if INCLUDE_CURVE:
-        inv_base = numpyro.sample("inv_base", dist.Normal(0.0, 0.05))         # bull: ~0 (normal curve)
-        inv_bear_gap = numpyro.sample("inv_bear_gap", dist.HalfNormal(0.40))  # bear: curve INVERTED (>0)
-        inv_tbull_gap = numpyro.sample("inv_tbull_gap", dist.HalfNormal(0.20))  # tbull: mild inversion
-        inv_loc = jnp.stack([inv_base + inv_bear_gap, inv_base + inv_tbull_gap, inv_base])  # [BEAR,TBULL,BULL]
-        inv_scale = numpyro.sample("inv_scale", dist.HalfNormal(0.30))
+    # (The macro emission channels that once lived here -- credit-spread widening (cs_chg)
+    # and yield-curve inversion depth (inv) -- were removed 2026-08-16; not shipped. See
+    # docs/unused_ideas/macro_leading_indicators.md.)
 
     def state_evolution(x, u, t_now, t_next):
         return dist.Categorical(probs=A[x])
@@ -824,17 +768,10 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
             )
         else:  # "normal"
             d_dist = dist.Normal(loc=dd_loc[x], scale=dd_scale)
-        # Extra macro channels, appended in the SAME order as _OBS_COLS: credit then curve.
-        extra = []
-        if INCLUDE_CREDIT:
-            extra.append(dist.Normal(loc=cs_loc[x], scale=cs_scale))
-        if INCLUDE_CURVE:
-            extra.append(dist.Normal(loc=inv_loc[x], scale=inv_scale))
         return _JointRV(
             r_dist=dist.StudentT(df=tail_dof, loc=mean_return[x], scale=return_vols[x]),
             v_dist=dist.StudentT(df=v_tail_dof, loc=v_loc[x], scale=v_scale),
             d_dist=d_dist,
-            extra_dists=extra,
         )
 
     dynamics = DynamicalModel(
@@ -870,7 +807,7 @@ def fit(
 
     `train_obs` is the BIVARIATE frame from RegimeDataset.observations() (or its
     train split): a pandas DataFrame indexed by week with columns ["r_t", "v_t"].
-    Index position is used as obs_times (evenly spaced weekly cadence, section 3).
+    Index position is used as obs_times (evenly spaced weekly cadence).
 
     obs_values is stacked to shape (T, 2) = [r_t, v_t] per week -- the vector
     observation layout the dynestyx handler expects (handlers.py: "(..., T, D)
@@ -897,55 +834,14 @@ def fit(
     return mcmc
 
 
-# Durable artifacts live in equity_market/outputs/ (already git-ignored alongside
-# *.pkl -- see .gitignore). NUTS fits are expensive, so we cache the posterior
-# samples there and reload instead of refitting.
-import pathlib as _pathlib
-
-_OUTPUTS_DIR = _pathlib.Path(__file__).resolve().parents[2] / "outputs"
-
-
-def save_fit(mcmc, name: str, extra: dict | None = None) -> _pathlib.Path:
-    """Persist a fitted model's POSTERIOR SAMPLES (+ optional extras) to
-    outputs/<name>.pkl so it can be reloaded without a fresh NUTS run.
-
-    We save mcmc.get_samples() (a plain dict of numpy/jax arrays, including the
-    recorded f_filtered_states) rather than the live MCMC object -- portable and
-    reload-safe. `extra` can carry the channel config / P(bear) curve / dates so a
-    saved fit is self-describing. Records _OBS_COLS so a reload knows which channels
-    the fit used. Returns the written path.
-    """
-    import pickle
-    import numpy as _np
-
-    _OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    samples = {k: _np.asarray(v) for k, v in mcmc.get_samples().items()}
-    payload = {"samples": samples, "obs_cols": list(_OBS_COLS)}
-    if extra:
-        payload["extra"] = extra
-    path = _OUTPUTS_DIR / f"{name}.pkl"
-    with open(path, "wb") as fh:
-        pickle.dump(payload, fh)
-    return path
-
-
-def load_fit(name: str) -> dict:
-    """Reload a fit saved by save_fit -> {"samples": {...}, "obs_cols": [...], ...}.
-
-    The returned "samples" dict can be fed to filtered_p_bear_over via a thin
-    Predictive wrapper, or inspected directly for posterior parameter values. Raises
-    FileNotFoundError if outputs/<name>.pkl is absent (nothing cached yet).
-    """
-    import pickle
-
-    path = _OUTPUTS_DIR / f"{name}.pkl"
-    with open(path, "rb") as fh:
-        return pickle.load(fh)
+# NOTE: save_fit / load_fit (the fit-cache pickle helpers) were moved to
+# model_utils/persistence.py -- they are model-agnostic (obs_cols is passed in), so they
+# no longer belong on this specific model. Import them from `persistence` if you need them.
 
 
 def filtered_p_bear(mcmc) -> jnp.ndarray:
     """Posterior-averaged filtered P(BEAR_t | y_1:t), one value per
-    training-week timestep, for use against section 7's evaluation.
+    training-week timestep, for use against the timeliness evaluation.
 
     BEAR is identified by the drift ladder (mu_bear the lowest rung, see
     regime_model docstring), so this is a real "bear" probability. Crucially it is
@@ -1012,8 +908,8 @@ def plot_regime_fit(
 ):
     """Single combined plot: price with ground-truth bear bands in the
     background, weekly log return, and the model's filtered P(bear_t) --
-    the section 7 "does the filtered nowcast anticipate the smoothed
-    ground truth" comparison, in one figure.
+    the "does the filtered nowcast anticipate the smoothed ground truth"
+    comparison, in one figure.
 
     `bear_label` is any 0/1 (BULL/BEAR) ground-truth Series on the plot's index
     -- currently the Pagan-Sossounov dating (labels.pagan_sossounov_label); the
@@ -1120,11 +1016,11 @@ def plot_regime_fit(
 
 
 import sys as _sys_wf  # noqa: E402
-from _run_modes import make_walk_forward_p_bear as _make_wf  # noqa: E402
+from fit_mode_processor import make_walk_forward_p_bear as _make_wf  # noqa: E402
 
 # Rolling-window OOS P(bear) refit. The logic is model-agnostic (it only calls this
 # module's fit / filtered_p_bear_over), so it comes from the shared factory in
-# _run_modes rather than a copy pasted into every model. WHY walk-forward: the vol
+# fit_mode_processor rather than a copy pasted into every model. WHY walk-forward: the vol
 # level v_bear drifts across eras (episodic/crisis-driven); a single global fit averages
 # calm and crisis bears into one v_bear that fits neither. Walk-forward fits ONLY the
 # trailing window per fold, so no parameter is a 70-year blend. WINDOW=8yr: shortest that
@@ -1135,10 +1031,10 @@ from _run_modes import make_walk_forward_p_bear as _make_wf  # noqa: E402
 walk_forward_p_bear = _make_wf(_sys_wf.modules[__name__])
 
 
-# ---- fit-mode runner hooks (consumed by _run_modes.run_main) --------------------
-# The global-vs-walkforward machinery + save_run wiring live once in _run_modes; each
-# model just exposes its config here. See _run_modes for the runner contract.
-needs_macro = _NEEDS_MACRO           # load the credit/curve macro CSVs when those channels are on
+# ---- fit-mode runner hooks (consumed by fit_mode_processor.run_main) --------------------
+# The global-vs-walkforward machinery + save_run wiring live once in fit_mode_processor; each
+# model just exposes its config here. See fit_mode_processor for the runner contract.
+needs_macro = _NEEDS_MACRO           # price-only model -> False (macro channels removed)
 obs_cols = _OBS_COLS                 # channel names -> run_name + saved spec
 
 
@@ -1149,10 +1045,7 @@ def obs_kwargs():
 def extra_spec():
     return {
         "include_drawdown": INCLUDE_DRAWDOWN,
-        "drawdown_window_weeks": _DRAWDOWN_WINDOW_WEEKS,
-        "include_credit": INCLUDE_CREDIT,
-        "credit_horizon_months": _CREDIT_HORIZON_MONTHS,
-        "include_curve": INCLUDE_CURVE,
+        "drawdown_reset_pct": _DRAWDOWN_RESET_PCT,
     }
 
 
@@ -1164,7 +1057,7 @@ def main(mode: str | None = None) -> None:
     `python regime_model_3state.py [global|walkforward]`.
     """
     import sys as _s
-    from _run_modes import run_main
+    from fit_mode_processor import run_main
     run_main(_s.modules[__name__], mode if mode is not None else FIT_MODE)
 
 

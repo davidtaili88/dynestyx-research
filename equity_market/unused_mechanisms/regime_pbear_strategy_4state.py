@@ -55,7 +55,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 import regime_model_4state as rm  # noqa: E402  (the model this file is hardwired to)
-from data import load_regime_dataset  # noqa: E402
+from data_acquisition import load_regime_dataset  # noqa: E402
 
 # This strategy is pinned to the 4-state model. Its cache/outputs carry this key so they
 # never collide with the shared script's 3-state artifacts.
@@ -124,7 +124,7 @@ P_SHORT_EXIT = 0.90     # once short, cover when P(bear) falls back below this
 SHORT_DWELL_WEEKS = 13  # consecutive weeks above P_SHORT_ENTER before shorting (1 quarter)
 SHORT_SIZE = 0.5        # short position size (hedge sleeve; 0 = long/flat only)
 WEEKS_PER_YEAR = 52.0   # weekly (W-FRI) bars -> annualization factor
-DATA_START = "1957-03-01"  # same history the model runs are fit/evaluated on (_run_modes)
+DATA_START = "1957-03-01"  # same history the model runs are fit/evaluated on (fit_mode_processor)
 
 
 # ----------------------------------------------------------------------------
@@ -136,20 +136,19 @@ def load_pbear(refit: bool = False):
     p_bear is the GLOBAL-fit causal filtered P(bear_t | y_1:t) from the 4-state model
     with its current channel config (r_t, v_t, dd). We fit ONCE on the 80/20 train split
     (rm.fit) and filter forward over ALL history (rm.filtered_p_bear_over) -- identical
-    to _run_modes._run_global, so the curve the strategy trades is exactly the one the
+    to fit_mode_processor._run_global, so the curve the strategy trades is exactly the one the
     nowcast plots. rm.filtered_p_bear_over SUMS both bear flavors (turbulent + calm), so
     P(bear) is total bear probability.
 
     The fit is cached to outputs/regime_4state_strategy_pbear.pkl (NUTS is expensive);
-    pass refit=True to force a fresh fit. save_fit/load_fit live on the 3-state module
-    (generic pickle helpers), so we borrow them; the 4-state never needs the macro CSVs.
+    pass refit=True to force a fresh fit. save_fit/load_fit are model-agnostic pickle
+    helpers in model_utils/persistence.py (obs_cols passed in); the 4-state never needs
+    the macro CSVs. NOTE (archived): persistence lives under src/models/model_utils/, which
+    is only on sys.path when run from the live tree -- move this file back to resurrect.
     """
-    import regime_model_3state as _base  # generic save_fit/load_fit pickle helpers
-    save_fit, load_fit = _base.save_fit, _base.load_fit
-    # KEY THE CACHE TO THE DD DEFINITION so switching the drawdown reference (event-reset
-    # cycle-peak vs 52wk trailing window) auto-selects a DIFFERENT cache instead of silently
-    # serving a stale curve. event-reset dd is the SAME length as window dd, so the length
-    # check below can't catch the change on its own -- this tag is what makes the switch safe.
+    from persistence import save_fit, load_fit  # model-agnostic pickle helpers
+    # KEY THE CACHE TO THE DD DEFINITION (event-reset %) so a config change auto-selects a
+    # DIFFERENT cache instead of silently serving a stale curve.
     _reset = getattr(rm, "_DRAWDOWN_RESET_PCT", None)
     _dd_tag = f"eventreset{int(_reset*100)}" if _reset is not None else "window"
     cache_name = f"regime_{MODEL_KEY}_strategy_pbear_{_dd_tag}"
@@ -179,7 +178,7 @@ def load_pbear(refit: bool = False):
     mcmc = rm.fit(train_obs)
     p_bear = np.asarray(rm.filtered_p_bear_over(mcmc, full_obs))
 
-    save_fit(mcmc, cache_name, extra={
+    save_fit(mcmc, cache_name, list(full_obs.columns), extra={
         "p_bear": p_bear,
         "dates": [str(d.date()) for d in idx],
         "obs_cols": list(full_obs.columns),
@@ -373,7 +372,7 @@ def _pagan_sossounov_bands(index: pd.Index) -> np.ndarray | None:
     """0/1 Pagan-Sossounov BEAR label aligned to `index` (1 = bear week), or None if the
     labels module isn't importable. Same ground truth the nowcast plot shades (3-state twin)."""
     try:
-        from labels import pagan_sossounov_label
+        from naive_regime_label import pagan_sossounov_label
     except Exception:
         return None
     ds = load_regime_dataset(start=DATA_START, include_vix=False, include_macro=False)

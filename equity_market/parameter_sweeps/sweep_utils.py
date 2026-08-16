@@ -1,10 +1,11 @@
 """
-overfit_test_utils — generalizable plateau/cliff statistics for parameter-sweep
-overfitting tests.
+sweep_utils — generalizable plateau/cliff statistics for parameter sweeps
+(the overfitting check on a sweep's chosen value).
 
-Shared by every sweep_*.py driver in this folder. Given a 1-D sequence of outcome
-values (typically pooled payer P&L, one per swept parameter value), it answers the
-overfitting question:
+Consumed by the STRATEGY-P&L sweeps in this folder (currently sweep_lev_mult.py; it
+takes that sweep's Sharpe/P&L-vs-parameter curve). It is built for P&L-style outcomes, not
+model-fit metrics like recall/false-alarm. Given a 1-D sequence of outcome values (one
+per swept parameter value), it answers the overfitting question:
 
     Is the live parameter value sitting on a FLAT PLATEAU (a neighbourhood of values
     that all produce essentially the same outcome -> the exact number is a don't-care,

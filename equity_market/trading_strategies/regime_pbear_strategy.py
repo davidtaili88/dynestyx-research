@@ -1,21 +1,21 @@
 """Simple regime-switching S&P 500 strategy driven by a regime nowcast.
 
-Works with EITHER the 3-state (src/models/regime_model_3state.py) or the 4-state
-(regime_model_4state.py) model -- both expose channels [r_t, v_t, dd] and the same
-fit / filtered_p_bear_over interface, and in the 4-state P(bear) is the sum of both
-bear flavors (turbulent + calm). Pick with the --model CLI flag (default 3state).
+Driven by the 3-state model (src/models/regime_model_3state.py): channels [r_t, v_t, dd]
+via its fit / filtered_p_bear_over interface. (The 4-state variant was archived to
+unused_mechanisms/; --model 4state is no longer available.)
 
-FINAL DESIGN (2026-08-09 -- 2 legs, all TRANSITION-based; see the parameter block for the
-full evidence + anti-overfit reasoning behind every number):
-  * LONG core   : +1 when P(bear) < 0.90 (the model's BEAR LINE), else flat. Long unless
-                  the model calls an outright bear -- the one principled long/flat cutoff.
-  * RECOVERY LEV: raise the long to 1.25x while riding a bear's RECOVERY (armed when a bear
-                  resolves back down to bull-leaning, held until an early disturbance ends
-                  it, NO re-arm until a fresh bear). Recovery-momentum edge (~+6%/yr fwd).
-  * NO SHORT    : the momentum short was TESTED (5 variants) and REMOVED -- a more accurate
-                  nowcast (event-reset dd) already captures the downside by going flat in
-                  bears, so the short only added turnover + OOS drawdown. Code kept behind
-                  SHORT_SIZE=0 for reproducibility.
+DESIGN -- TWO legs, both TRANSITION-based (see the parameter block for the full evidence
+and anti-overfit reasoning behind every number):
+  * LONG core   : +1 when P(bear) < P_LONG (0.90, the model's BEAR LINE), else flat -- long
+                  unless the model calls an outright bear (the one principled long/flat cutoff).
+  * RECOVERY LEV: raise the long to LEV_MULT (1.25x) while riding a bear's RECOVERY (armed
+                  when a bear resolves back down to bull-leaning, held until an early
+                  disturbance ends it, NO re-arm until a fresh bear). Recovery-momentum edge.
+So positions are in {0, +1, +1.25x} -- long/flat with a leverage bump out of bears. (A
+momentum short was also tried; it added no net edge -- a more accurate nowcast already
+captures the downside by going flat in bears -- so it is DISABLED (SHORT_SIZE=0), left in
+the code only for reproducibility.)
+
 WHY TRANSITIONS not LEVELS: P(bear) is near-binary (~0 most weeks, ~1 in bears; only ~1% of
 weeks land in [0.25,0.60]) -- no gradient to size along -- so level-based sizing was tested
 and REJECTED. Pass --flat to fall back to plain long/flat.
@@ -26,14 +26,11 @@ The position implied by P(bear_t) is therefore only tradeable at the t close, so
 earns the return of week t+1. We shift the position forward one week before applying
 returns -- so no bar's return is ever earned by a signal that peeked at it.
 
-PnL / Sharpe / drawdown reporting mirrors the trading-project template style used for
-the short-bonds strategy: an equity curve, annualized return / vol / Sharpe, max
-drawdown, hit rate, and a strategy-vs-buy&hold plot.
+Reporting: an equity curve, annualized return / vol / Sharpe, max drawdown, hit rate,
+and a strategy-vs-buy&hold plot.
 
-Run:  python trading_strategies/regime_pbear_strategy.py                  # 3-state (default)
-      python trading_strategies/regime_pbear_strategy.py --model 4state   # 4-state
+Run:  python trading_strategies/regime_pbear_strategy.py                  # 3-state
       python trading_strategies/regime_pbear_strategy.py --refit          # ignore cache, refit NUTS
-      python trading_strategies/regime_pbear_strategy.py --cost-bps 5     # net of 5 bps/unit turnover
 """
 
 from __future__ import annotations
@@ -52,13 +49,13 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 import importlib  # noqa: E402
-from data import load_regime_dataset  # noqa: E402
+from data_acquisition import load_regime_dataset  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
 # Strategy parameters
 # ----------------------------------------------------------------------------
-# FINAL DESIGN (2026-07-30). Every rule below is a MECHANISM tied to a P(bear) TRANSITION
+# FINAL DESIGN (2026-08-09). Every rule below is a MECHANISM tied to a P(bear) TRANSITION
 # (an event: crossing a line, peaking, resolving), NOT a size read off P(bear)'s LEVEL.
 # This was a deliberate anti-overfit choice: we tested level-based sizing and it FAILED
 # (P(bear) is near-binary -- ~0 most weeks, ~1 in bears -- with rank-corr ~0.03 to forward
@@ -66,12 +63,11 @@ from data import load_regime_dataset  # noqa: E402
 # are 16-56wk noise). Transitions, by contrast, gave replicated edges. See the block above
 # each parameter for the evidence.
 #
-# THREE LEGS:
+# TWO LIVE LEGS (the momentum short was tested and DISABLED 2026-08-08 -- see SHORT_SIZE):
 #   LONG core   : long when P(bear) < P_LONG, else flat.
 #   RECOVERY LEV: lever the LONG to LEV_MULT through a bear's recovery (a real state), armed
 #                 only when a bear RESOLVES, held until a fresh DISTURBANCE, NO re-arm.
-#   MOMENTUM SHT: half-size short that FADES THE ENTRY into a bear (up-cross of P_SHORT),
-#                 exits a few weeks after P(bear) peaks -- captures the drop, not the bounce.
+#   (MOMENTUM SHT: kept behind SHORT_SIZE=0 for reproducibility; not part of the live book.)
 #
 # ---- LONG core -------------------------------------------------------------------------
 # P_LONG=0.90 (2026-08-09): stay long until P(bear) crosses the model's OWN BEAR LINE (0.90).
@@ -91,43 +87,42 @@ P_LONG = 0.90
 # MECHANISM: "longing extra units" only makes sense with a WHY. The why is RECOVERY
 # MOMENTUM -- weeks where P(bear) is FALLING out of a bear earned +14.5%/yr fwd vs +9.2%
 # for long-eligible weeks overall (n=220, a real sample, not a level bucket). So we lever
-# the LONG while the market is climbing OUT of a bear.
-#   LEV_MULT=1.25: a multiple sweep showed Sharpe PEAKS at ~1.25-1.5x then declines while
-#     drawdown worsens monotonically -- past ~1.5x you buy return purely with risk. 1.25x
-#     is the conservative edge of the plateau (Sharpe 0.581 vs 0.570 base; 1.5x=0.586 but
-#     -58% DD). NOT the argmax; the low end of the plateau.
-#   REARM_BEAR_LINE=0.90 / LEV_ARM=0.60: a "recovery" begins when, having been in a bear
-#     (P(bear)>0.90), P(bear) resolves back down through 0.60 (LEV_ARM). We ride the whole
-#     rebound as a STATE, not per-week.
-#   LEV_DISTURB=0.25: the recovery (and the leverage) ENDS the moment P(bear) climbs back
-#     above 0.25 -- a fresh sign of stress. Sweep put the Sharpe max right at 0.25 (0.10 too
-#     twitchy, 0.40+ holds leverage into the next leg down).
-#   NO RE-ARM: once a disturbance ends the leverage we do NOT re-lever on the next dip under
-#     0.25; we require a WHOLE NEW bear cycle (>0.90 then resolve) first. Tested: re-arming
-#     adds 1000+ levered weeks but LOWERS Sharpe (0.581->0.567) -- re-levering into a market
-#     that already showed stress is uncompensated risk. Confirmed OOS too (0.83 vs 0.79).
-LEV_MULT = 1.25
-# LEV_ARM=0.60: arm the recovery once P(bear) resolves back down to BULL-LEANING territory.
-# This is a CONCEPTUAL-CLARITY choice, not a performance one: the arm line is NOT load-bearing
-# (arm 0.60 vs 0.90 both give Sharpe ~0.585 because the disturb logic decides when leverage
-# actually engages), so we pick the value with the defensible STORY. 0.60 = "arm once the model
-# is back to bull-leaning"; 0.90 would mean "start levering while the model still calls it a
-# ~90%-bear" -- indefensible to state even if it scores the same. So 0.60. Arming LOWER (0.10,
-# 'wait for full bull confirmation') was tested and is WORSE (0.573): the recovery-momentum edge
-# is front-loaded, so you must arm as it resolves, not after. REARM (0.90) is the bear line that
-# must precede a recovery.
-LEV_ARM = 0.60            # recovery armed when P(bear) resolves back to bull-leaning (conceptual clarity; not load-bearing)
+# the LONG while the market is climbing OUT of a bear. Each threshold below sits directly
+# above its own assignment.
+#
+# LEV_MULT: a multiple sweep showed Sharpe PEAKS at ~1.25-1.5x then declines while drawdown
+# worsens monotonically -- past ~1.5x you buy return purely with risk. 1.25x is the
+# conservative edge of the plateau (Sharpe 0.581 vs 0.570 base; 1.5x=0.586 but -58% DD).
+# NOT the argmax; the low end of the plateau.
+LEV_MULT = 1.25           # lever the long to this multiple through a bear's recovery
+#
+# LEV_ARM / REARM_BEAR_LINE: a "recovery" begins when, having been in a bear
+# (P(bear) > REARM_BEAR_LINE), P(bear) resolves back down through LEV_ARM -- we ride the
+# whole rebound as a STATE, not per-week. LEV_ARM is a CONCEPTUAL-CLARITY choice, not a
+# performance one: it's NOT load-bearing (arm 0.60 vs 0.90 both give Sharpe ~0.585 because
+# the disturb logic decides when leverage actually engages), so we pick the defensible STORY.
+# 0.60 = "arm once the model is back to bull-leaning"; 0.90 would mean "start levering while
+# the model still calls it a ~90%-bear" -- indefensible even if it scores the same. Arming
+# LOWER (0.10, 'wait for full bull confirmation') is WORSE (0.573): the recovery-momentum
+# edge is front-loaded, so you must arm as it resolves, not after.
+LEV_ARM = 0.60            # recovery armed when P(bear) resolves back down through this (bull-leaning)
 REARM_BEAR_LINE = 0.90    # "a bear" = P(bear) exceeded this (what must precede a recovery)
-# LEV_DISTURB=0.25: the ONE genuinely un-derivable threshold, framed HONESTLY as a declared
-# early-exit RISK POSTURE ("pull the extra leverage at the first real sign of stress"), NOT an
-# optimum. The EARLINESS is tested-and-justified: every LATER / CONDITIONED exit is worse --
-# raising it toward the bear line rides leverage into bears (0.60 -> Sharpe 0.570); a duration
-# GRACE period (ignore early-bull spikes for ~26wk = shortest bull, then heed) is worse (0.578),
-# because some 'early chop' spikes are real continuation legs (dotcom) the early exit correctly
-# catches; whipsaw-lock / re-lever / duration-scaling all tested flat-to-worse. The exact decimal
-# is insensitive in the early band (0.25 vs 0.40 ~ same; only ~1% of weeks live in [0.25,0.60]),
-# so 0.25 is the conservative (earliest) choice in that band. Disclosed posture, not a fit.
-LEV_DISTURB = 0.25        # recovery/leverage ends when P(bear) climbs back above this (declared early-exit risk posture)
+#
+# LEV_DISTURB: the recovery (and the leverage) ENDS the moment P(bear) climbs back above
+# this -- a fresh sign of stress. The ONE genuinely un-derivable threshold, framed HONESTLY
+# as a declared early-exit RISK POSTURE ("pull the extra leverage at the first real sign of
+# stress"), NOT an optimum. The EARLINESS is tested-and-justified: every LATER/CONDITIONED
+# exit is worse -- raising it toward the bear line rides leverage into bears (0.60 -> Sharpe
+# 0.570); a duration GRACE period (ignore early-bull spikes for ~26wk then heed) is worse
+# (0.578), because some 'early chop' spikes are real continuation legs (dotcom) the early
+# exit correctly catches. The exact decimal is insensitive in the early band (0.25 vs 0.40 ~
+# same; only ~1% of weeks live in [0.25,0.60]), so 0.25 is the conservative (earliest) choice.
+LEV_DISTURB = 0.25        # recovery/leverage ends when P(bear) climbs back above this (early-exit posture)
+#
+# NO RE-ARM: once a disturbance ends the leverage we do NOT re-lever on the next dip under
+# LEV_DISTURB; we require a WHOLE NEW bear cycle (> REARM_BEAR_LINE then resolve) first.
+# Tested: re-arming adds 1000+ levered weeks but LOWERS Sharpe (0.581->0.567) -- re-levering
+# into a market that already showed stress is uncompensated risk. Confirmed OOS (0.83 vs 0.79).
 #
 # ---- MOMENTUM SHORT --------------------------------------------------------------------
 # MECHANISM: the losing zone is the DESCENT into a bear, not any P(bear) level. Forward
@@ -159,31 +154,28 @@ SHORT_PEAK_TAIL = 3      # weeks to hold after P(bear) first ticks down, then ha
 SHORT_SIZE = 0.0         # DISABLED (was 0.5) -- see the note above; no-short wins OOS
 #
 WEEKS_PER_YEAR = 52.0    # weekly (W-FRI) bars -> annualization factor
-DATA_START = "1957-03-01"  # same history the model runs are fit/evaluated on (_run_modes)
-#
-# ---- TRANSACTION COSTS -----------------------------------------------------------------
-# Cost charged per unit of position TURNOVER. A trade of size |Δposition| (e.g. going
-# 0 -> +1 is 1 unit, +1 -> +1.25x recovery is 0.25 unit, +1 -> -0.5 short is 1.5 units)
-# costs COST_PER_TURN * |Δposition| in return terms, subtracted from that week's return.
-# COST_PER_TURN bundles commission + spread + slippage as a fraction of notional traded.
-# 5 bps (0.0005) is a realistic round-trip-ish estimate for a liquid S&P proxy (ETF /
-# futures); a round trip in and out therefore costs ~2*5=10 bps. Off by default so the
-# frictionless comparison is unchanged; pass --cost-bps N to turn it on.
-COST_PER_TURN = 0.0005   # 5 bps per unit of |Δposition| traded (one-way)
+DATA_START = "1957-03-01"  # same history the model runs are fit/evaluated on (fit_mode_processor)
+# NOTE: results are FRICTIONLESS. A turnover-based transaction-cost model was built but not
+# validated/calibrated, so it was removed from here -- see unused_mechanisms/transaction_costs.md.
+# (The backtest engine still accepts a dormant cost_per_turn=0.0 kwarg if it's ever re-enabled.)
 
 
 def _load_model(model_key: str):
-    """Import the regime model module for `model_key` in {"3state", "4state"}.
+    """Import the regime model module for `model_key`. Only "3state" is live.
 
-    Both modules expose the SAME interface the strategy needs: fit(train_obs),
-    filtered_p_bear_over(mcmc, frame), obs_kwargs(). save_fit/load_fit and the
-    _NEEDS_MACRO flag live on the 3-state module; the 4-state reuses them (it never
-    needs macro), so we fall back to the 3-state helpers / False when absent.
+    The 3-state model exposes the interface the strategy needs: fit(train_obs),
+    filtered_p_bear_over(mcmc, frame), obs_kwargs(), _NEEDS_MACRO. (The fit-cache pickle
+    helpers save_fit/load_fit are model-agnostic and now live in model_utils/persistence.)
+    (The 4-state model was archived to unused_mechanisms/, so model_key="4state" is no
+    longer available -- it is kept only as a reference implementation.)
     """
-    mod = importlib.import_module(f"regime_model_{model_key}")
-    import regime_model_3state as _base
-    save_fit = getattr(mod, "save_fit", _base.save_fit)
-    load_fit = getattr(mod, "load_fit", _base.load_fit)
+    if model_key != "3state":
+        raise ValueError(
+            f"model_key={model_key!r} is not available: only the 3-state model is live. "
+            "The 4-state model was moved to unused_mechanisms/ (reference only)."
+        )
+    mod = importlib.import_module("regime_model_3state")
+    from persistence import save_fit, load_fit
     needs_macro = getattr(mod, "_NEEDS_MACRO", getattr(mod, "needs_macro", False))
     return mod, save_fit, load_fit, needs_macro
 
@@ -197,7 +189,7 @@ def load_pbear(model_key: str = "3state", refit: bool = False):
     p_bear is the GLOBAL-fit causal filtered P(bear_t | y_1:t) from the chosen model
     (3state or 4state) with its current channel config (r_t, v_t, dd). We fit ONCE on
     the 80/20 train split (model.fit) and filter forward over ALL history
-    (model.filtered_p_bear_over) -- identical to _run_modes._run_global, so the curve
+    (model.filtered_p_bear_over) -- identical to fit_mode_processor._run_global, so the curve
     the strategy trades is exactly the one the nowcast plots. In the 4-state,
     filtered_p_bear_over already sums BOTH bear flavors, so P(bear) means the same
     thing (total bear probability) in both models.
@@ -243,7 +235,7 @@ def load_pbear(model_key: str = "3state", refit: bool = False):
     p_bear = np.asarray(mod.filtered_p_bear_over(mcmc, full_obs))
 
     # Cache just the curve + its dates (not the whole fit) via save_fit's `extra`.
-    save_fit(mcmc, cache_name, extra={
+    save_fit(mcmc, cache_name, list(full_obs.columns), extra={
         "p_bear": p_bear,
         "dates": [str(d.date()) for d in idx],
         "obs_cols": list(full_obs.columns),
@@ -252,7 +244,7 @@ def load_pbear(model_key: str = "3state", refit: bool = False):
 
 
 # ----------------------------------------------------------------------------
-# 2. Turn P(bear) into a position (three transition-based legs; see the parameter block)
+# 2. Turn P(bear) into a position (TWO live transition-based legs; see the parameter block)
 # ----------------------------------------------------------------------------
 def build_positions(p_bear: pd.Series, p_long: float = P_LONG,
                     lev_mult: float = LEV_MULT, lev_arm: float = LEV_ARM,
@@ -261,9 +253,7 @@ def build_positions(p_bear: pd.Series, p_long: float = P_LONG,
                     short_size: float = SHORT_SIZE, flat: bool = False) -> pd.Series:
     """Map the P(bear) curve to a per-week position (causal: uses only p_bear up to t).
 
-    Position value: +1 long core, +lev_mult in a recovery, -short_size in a momentum
-    short, 0 flat. A single stateful left-to-right sweep runs all three legs; short and
-    recovery are mutually exclusive in practice (a bear vs a post-bear rebound).
+    TWO LIVE LEGS -- long core + recovery leverage -- giving positions in {0, +1, +lev_mult}:
 
       LONG core   : +1 whenever p_bear < p_long, else 0 (flat).
       RECOVERY LEV: while long, raise +1 -> lev_mult during a recovery STATE. The state is
@@ -271,9 +261,11 @@ def build_positions(p_bear: pd.Series, p_long: float = P_LONG,
         through lev_arm; it ENDS on a disturbance (p_bear climbs back above lev_disturb).
         NO RE-ARM: after a disturbance we require a whole NEW bear (>rearm_bear_line) before
         re-levering -- we do not re-lever on a mere dip back under lev_disturb.
-      MOMENTUM SHT: on the UP-CROSS of p_short (prev<=p_short & now>p_short) open a
-        -short_size short; once p_bear first ticks DOWN (the peak), hold short_peak_tail
-        more weeks then HARD-EXIT. Overrides the long while active.
+
+    (A momentum short leg also exists in the code but is DISABLED by default (short_size=0),
+    so it contributes nothing to the live book -- it was tested and added no edge; kept only
+    for reproducibility. When short_size>0 it opens a -short_size short on the up-cross of
+    p_short and exits short_peak_tail weeks after p_bear peaks, overriding the long.)
 
     flat=True short-circuits everything to the plain long/flat baseline (long if
     p_bear < p_long) for apples-to-apples comparison. Position at t is decided at the t
@@ -340,7 +332,7 @@ def build_positions(p_bear: pd.Series, p_long: float = P_LONG,
 
 
 # ----------------------------------------------------------------------------
-# 3. Backtest + performance stats (short-bonds-template style)
+# 3. Backtest + performance stats
 # ----------------------------------------------------------------------------
 def backtest(price: pd.Series, r_t: pd.Series, positions: pd.Series,
              cost_per_turn: float = 0.0) -> pd.DataFrame:
@@ -350,14 +342,8 @@ def backtest(price: pd.Series, r_t: pd.Series, positions: pd.Series,
     week t+1's return, so we use positions.shift(1). Strategy log return_t =
     pos_{t-1} * r_t. We also track buy&hold (always +1) for comparison.
 
-    TRANSACTION COSTS. pos_traded_t is the position actually HELD during week t. When
-    that held position changes from week t-1 to week t, a trade of size
-    |pos_traded_t - pos_traded_{t-1}| was executed at the t-1 close (the moment the new
-    signal became actionable). We charge cost_per_turn * |Δpos_traded| against week t's
-    return, so the equity curve pays the friction the week the trade is put on. Turnover
-    is |Δposition| in UNITS of notional: 0->+1 = 1 unit, +1->1.25x = 0.25, +1->-0.5 =
-    1.5. cost_per_turn=0 (default) reproduces the frictionless curve exactly. The buy&hold
-    leg pays a single entry cost of cost_per_turn (one unit, bought once at the start).
+    Runs FRICTIONLESS by default (cost_per_turn=0). The cost_per_turn kwarg is a dormant
+    hook for a deferred turnover-cost model -- see unused_mechanisms/transaction_costs.md.
 
     Returns a DataFrame indexed by week with: p-return columns, cumulative equity
     curves (start=1.0), and the traded position.
@@ -406,9 +392,8 @@ def performance_stats(logret: pd.Series, equity: pd.Series, positions: pd.Series
                       turnover: pd.Series | None = None, cost_logret: pd.Series | None = None) -> dict:
     """Annualized return / vol / Sharpe, total return, max drawdown, hit rate, exposure.
 
-    Sharpe here is EXCESS-of-zero (risk-free ~0), matching the simple short-bonds
-    template. Returns are weekly LOG returns; we annualize by *52 (mean) and
-    *sqrt(52) (vol), the standard weekly convention.
+    Sharpe here is EXCESS-of-zero (risk-free ~0). Returns are weekly LOG returns;
+    we annualize by *52 (mean) and *sqrt(52) (vol), the standard weekly convention.
     """
     lr = logret.dropna()
     n = len(lr)
@@ -470,7 +455,7 @@ def _pagan_sossounov_bands(index: pd.Index) -> np.ndarray | None:
     """0/1 Pagan-Sossounov BEAR label aligned to `index` (1 = bear week), or None if
     the labels module isn't importable. Same ground truth the nowcast plot shades."""
     try:
-        from labels import pagan_sossounov_label
+        from pagan_sossounov import pagan_sossounov_label
     except Exception:
         return None
     ds = load_regime_dataset(start=DATA_START, include_vix=False, include_macro=False)
@@ -662,7 +647,7 @@ def main(model_key: str = "3state", refit: bool = False, flat: bool = False,
     bh = performance_stats(df["bh_logret"], df["bh_equity"])
 
     cost_desc = (f"  (net of {cost_per_turn*1e4:.1f} bps/unit-turnover transaction costs)"
-                 if cost_per_turn > 0 else "  (frictionless -- pass --cost-bps N for costs)")
+                 if cost_per_turn > 0 else "  (frictionless)")
     _short_desc = (f" + {SHORT_SIZE:g}x momentum short (up-cross {P_SHORT:.0%}, peak+{SHORT_PEAK_TAIL}wk)"
                    if SHORT_SIZE > 0 else "  [short OFF]")
     desc = ("PLAIN long/flat (baseline)" if flat else
@@ -713,7 +698,6 @@ if __name__ == "__main__":
         refit="--refit" in argv,
         flat="--flat" in argv,          # fall back to plain long/flat for comparison
         do_sweep="--sweep" in argv,
-        # --cost-bps N : transaction cost in basis points per UNIT of position turnover
-        # (one-way). Default 0 = frictionless. e.g. --cost-bps 5 -> 5 bps per unit.
-        cost_per_turn=_flag(argv, "--cost-bps", float, 0.0) * 1e-4,
+        # (transaction costs deferred -- see unused_mechanisms/transaction_costs.md;
+        #  main() keeps cost_per_turn=0.0 default so the engine runs frictionless.)
     )

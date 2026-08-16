@@ -326,9 +326,9 @@ def plot_regime_fit(*args, **kwargs):
     return _plot_regime_fit_base(*args, **kwargs)
 
 
-# ---- fit-mode runner hooks (see _run_modes.run_main) ----------------------------
+# ---- fit-mode runner hooks (see fit_mode_processor.run_main) ----------------------------
 import sys as _sys_wf  # noqa: E402
-from _run_modes import make_walk_forward_p_bear as _make_wf  # noqa: E402
+from fit_mode_processor import make_walk_forward_p_bear as _make_wf  # noqa: E402
 
 walk_forward_p_bear = _make_wf(_sys_wf.modules[__name__])
 
@@ -353,7 +353,7 @@ def main(mode: str | None = None) -> None:
     """Fit + evaluate + plot + save. mode: 'global' (80/20, fast) | 'walkforward'
     (rolling refits, slow); None -> FIT_MODE. CLI arg overrides:
     `python regime_model_2state_hsmm.py [global|walkforward]`."""
-    from _run_modes import run_main
+    from fit_mode_processor import run_main
     run_main(_sys_wf.modules[__name__], mode if mode is not None else FIT_MODE)
 
 

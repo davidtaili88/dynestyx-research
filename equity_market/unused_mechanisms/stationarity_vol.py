@@ -284,7 +284,7 @@ def plot_era_posteriors(eras: list[EraVolPosterior], save_path=None):
 
 
 def main() -> None:
-    from data import load_regime_dataset
+    from data_acquisition import load_regime_dataset
 
     # Full history, model's realized-vol channel (no VIX) -- same data the 2-state
     # model uses. Eras are pure calendar cuts (no P&S labels), so the labeler's

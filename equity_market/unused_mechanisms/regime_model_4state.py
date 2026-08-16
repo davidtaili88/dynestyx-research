@@ -75,14 +75,13 @@ _IS_TURBULENT = jnp.array([1, 0, 1, 0])  # [turb_bear, calm_bear, turb_bull, cal
 # so BOTH bear flavors sit underwater and BOTH bull flavors ~0 -- and it reinforces the
 # calm-bear state (a calm grind is still underwater though its vol looks bull-like).
 INCLUDE_DRAWDOWN = True
-_DRAWDOWN_WINDOW_WEEKS = 52  # 1yr; only used when _DRAWDOWN_RESET_PCT is None (trailing-window peak)
-# DRAWDOWN REFERENCE PEAK (ported from regime_model_3state 2026-08-09). None -> 52wk
-# trailing-window peak (original). 0.20 -> EVENT-RESET / cycle-peak dd: the reference holds
-# the pre-crash high through a bear and resets when price rises 20% off the trough (textbook
-# new bull), fixing the recovery lag at the source. Emission stays NORMAL (the 2x2 ablation
-# showed the hurdle emission -- correctly specified but faithful to a laggy channel -- makes
-# the nowcast LAGGIER; the Normal's mis-specification down-weights dd, which helps). See
-# data.drawdown() + [[drawdown-window-is-wrong-knob]].
+# DRAWDOWN REFERENCE PEAK = EVENT-RESET / cycle-peak dd (ported from regime_model_3state
+# 2026-08-09): the reference holds the pre-crash high through a bear and resets when price
+# rises _DRAWDOWN_RESET_PCT off the trough (a textbook +20% new bull), fixing the recovery
+# lag at the source. Emission stays NORMAL (the 2x2 ablation showed the hurdle emission --
+# correctly specified but faithful to a laggy channel -- makes the nowcast LAGGIER; the
+# Normal's mis-specification down-weights dd, which helps). See data_acquisition.drawdown() +
+# [[drawdown-window-is-wrong-knob]]. (The old fixed trailing-window peak was dropped.)
 _DRAWDOWN_RESET_PCT = 0.20
 _OBS_COLS = ["r_t", "v_t", "dd"] if INCLUDE_DRAWDOWN else ["r_t", "v_t"]
 
@@ -311,10 +310,10 @@ def plot_regime_fit(*args, **kwargs):
     return _plot_regime_fit_base(*args, **kwargs)
 
 
-# ---- fit-mode runner hooks (see _run_modes.run_main) ----------------------------
+# ---- fit-mode runner hooks (see fit_mode_processor.run_main) ----------------------------
 # Walk-forward comes from the shared factory (logic only needs fit/filtered_p_bear_over).
 import sys as _sys_wf  # noqa: E402
-from _run_modes import make_walk_forward_p_bear as _make_wf  # noqa: E402
+from fit_mode_processor import make_walk_forward_p_bear as _make_wf  # noqa: E402
 
 walk_forward_p_bear = _make_wf(_sys_wf.modules[__name__])
 
@@ -328,20 +327,18 @@ FIT_MODE = "global"
 
 
 def obs_kwargs():
-    return dict(include_drawdown=INCLUDE_DRAWDOWN, drawdown_window_weeks=_DRAWDOWN_WINDOW_WEEKS,
-                drawdown_reset_pct=_DRAWDOWN_RESET_PCT)
+    return dict(include_drawdown=INCLUDE_DRAWDOWN, drawdown_reset_pct=_DRAWDOWN_RESET_PCT)
 
 
 def extra_spec():
-    return {"include_drawdown": INCLUDE_DRAWDOWN, "drawdown_window_weeks": _DRAWDOWN_WINDOW_WEEKS,
-            "drawdown_reset_pct": _DRAWDOWN_RESET_PCT}
+    return {"include_drawdown": INCLUDE_DRAWDOWN, "drawdown_reset_pct": _DRAWDOWN_RESET_PCT}
 
 
 def main(mode: str | None = None) -> None:
     """Fit + evaluate + plot + save. mode: 'global' (80/20, fast) | 'walkforward'
     (rolling 8yr refits, slow); None -> FIT_MODE. CLI arg overrides:
     `python regime_model_4state.py [global|walkforward]`."""
-    from _run_modes import run_main
+    from fit_mode_processor import run_main
     run_main(_sys_wf.modules[__name__], mode if mode is not None else FIT_MODE)
 
 

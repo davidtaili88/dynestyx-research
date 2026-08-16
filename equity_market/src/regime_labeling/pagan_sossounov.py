@@ -7,8 +7,8 @@ Econometrics 18(1). It is the Bry-Boschan (1971) turning-point procedure adapted
 to stock prices: date PEAKS and TROUGHS as local extrema, then censor by minimum
 phase/cycle DURATION. A regime is a sustained phase between two turning points,
 so -- unlike a 20% drawdown rule -- it structurally cannot be triggered by a
-transient dip. This is why it is the right GROUND TRUTH for the regime nowcast
-(see labels.py, which imports pagan_sossounov_label from here).
+transient dip. This is why it is the right GROUND TRUTH for the regime nowcast.
+Import pagan_sossounov_label directly from this module.
 
 FAITHFULNESS TO bbdetection. The R package's dating routine
 (setpar_dating_alg) takes exactly these parameters, all counted in OBSERVATIONS:
@@ -415,7 +415,7 @@ def _print_phase_table(table: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    from data import load_regime_dataset
+    from data_acquisition import load_regime_dataset
 
     ds = load_regime_dataset(start="1990-01-01", include_vix=False)
     price = ds.weekly_price

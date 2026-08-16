@@ -15,13 +15,15 @@ Each model module M must provide (the uniform bits every model already has):
 Optional hooks (read via getattr with safe defaults, so simple bivariate models and
 channel-augmented ones both work):
   M.obs_kwargs()  -> dict passed to ds.observations()/ds.split(); default {} (bivariate)
-  M.needs_macro   -> bool, load the macro CSVs (credit/curve); default False
+  M.needs_macro   -> bool, load macro CSVs; default False (all current models are price-only)
   M.obs_cols()    -> list[str] channel names for the run_name/spec; default from a
                      probe of ds.observations(**obs_kwargs).columns
   M.extra_spec()  -> dict of extra config to record; default {}
   M.walk_train_years / M.walk_step_years -> walk-forward window/step; default 8 / 1
 """
 from __future__ import annotations
+
+import pathlib as _pathlib
 
 
 def _cfg(model, name, default):
@@ -32,7 +34,7 @@ def _cfg(model, name, default):
 
 
 def _load_ds(model):
-    from data import load_regime_dataset
+    from data_acquisition import load_regime_dataset
 
     needs_macro = _cfg(model, "needs_macro", False)
     return load_regime_dataset(start="1957-03-01", include_vix=False, include_macro=needs_macro)
@@ -46,17 +48,77 @@ def _obs_cols(model, obs_frame):
     return [c for c in obs_frame.columns]
 
 
+def _module_name(model) -> str:
+    """Real module name of `model`, robust to being run as __main__.
+
+    When a model file is run DIRECTLY (python regime_model_3state.py), its __name__ is
+    "__main__" -- which would produce cache/run names like "regime___main___..." that no
+    other file (e.g. the strategy's load_pbear, which uses model_key="3state") can find.
+    Fall back to the file stem in that case so a direct run and an imported run agree.
+    """
+    n = model.__name__.split(".")[-1]
+    if n == "__main__":
+        f = getattr(model, "__file__", None)
+        if f:
+            n = _pathlib.Path(f).stem
+    return n
+
+
 def _short_model_name(model) -> str:
     # regime_model_3state -> 3state ; regime_model_2state_hsmm -> 2state_hsmm
-    n = model.__name__.split(".")[-1]
-    return n.replace("regime_model_", "")
+    return _module_name(model).replace("regime_model_", "")
+
+
+def _strategy_cache_name(model, mode: str) -> str:
+    """The SHARED P(bear) cache name that downstream code (the trading strategy /
+    parameter sweeps via load_pbear) reads.
+
+    This MUST match how regime_pbear_strategy.load_pbear builds its cache name:
+        regime_<short_model>_strategy_pbear[_<DD_EMISSION>]
+    -- keyed to the emission tag so switching emission auto-selects a different cache.
+    The GLOBAL fit writes exactly that canonical name (what load_pbear reads by
+    default). The WALK-FORWARD fit writes the same stem + "_walkforward" so it is
+    ALSO cached but never clobbers the canonical global curve the strategy expects.
+    """
+    short = _short_model_name(model)
+    emission_tag = getattr(model, "DD_EMISSION", None)
+    base = f"regime_{short}_strategy_pbear_{emission_tag}" if emission_tag \
+        else f"regime_{short}_strategy_pbear"
+    return base if mode == "global" else f"{base}_walkforward"
+
+
+def _write_strategy_cache(model, name: str, p_bear, idx) -> None:
+    """Write the P(bear) curve in the shape load_pbear expects: a save_fit payload with
+    extra={"p_bear","dates","obs_cols"}. Uses persistence.save_fit (model-agnostic).
+
+    We only want the CURVE cached, not posterior samples, so we hand save_fit a tiny stub
+    whose get_samples() returns {} (save_fit calls mcmc.get_samples()).
+    """
+    import numpy as _np
+    from persistence import save_fit
+
+    obs_cols = list(_cfg(model, "obs_cols", []) or [])
+    extra = {
+        "p_bear": _np.asarray(p_bear, dtype=float),
+        "dates": [str(_d.date()) for _d in idx],
+        "obs_cols": obs_cols,
+    }
+
+    class _NoSamples:
+        @staticmethod
+        def get_samples():
+            return {}
+
+    save_fit(_NoSamples(), name, obs_cols, extra=extra)
+    print(f"[strategy-cache] wrote outputs/{name}.pkl "
+          f"(P(bear) curve shared with the trading strategy / sweeps)")
 
 
 def _run_global(model) -> None:
     """Single 80/20 fit, filtered forward over all history (train/test generalization)."""
-    from labels import pagan_sossounov_label
+    from pagan_sossounov import pagan_sossounov_label
     from pagan_sossounov import _T_CENSOR_MONTHS, _months_to_weeks
-    from _run_io import save_run
+    from persistence import save_run
 
     ds = _load_ds(model)
     kw = _cfg(model, "obs_kwargs", {})
@@ -76,12 +138,16 @@ def _run_global(model) -> None:
     extra.update(K=getattr(model, "K", None), fit="global 80/20", split_date=str(split_date.date()))
     save_run(
         f"regime_{_short_model_name(model)}_{'_'.join(cols)}_global",
-        model=model.__name__.split(".")[-1],
+        model=_module_name(model),
         obs_cols=cols,
         dates=idx, p_bear=p_bear, label=label,
         price=ds.weekly_price.loc[idx].to_numpy(),
         extra_spec=extra, mcmc=mcmc,
     )
+    # ALSO refresh the SHARED P(bear) cache the trading strategy / parameter sweeps read
+    # (load_pbear). The GLOBAL curve is the canonical one they consume, so running this
+    # model file is all that's needed to keep every downstream P(bear) reference current.
+    _write_strategy_cache(model, _strategy_cache_name(model, "global"), p_bear, idx)
 
     model.plot_regime_fit(
         dates=idx, price=ds.weekly_price.loc[idx], r_t=full_obs["r_t"],
@@ -93,9 +159,9 @@ def _run_global(model) -> None:
 
 def _run_walkforward(model) -> None:
     """Rolling trailing-window refits, stitched OOS P(bear) (non-stationarity-robust)."""
-    from labels import pagan_sossounov_label
+    from pagan_sossounov import pagan_sossounov_label
     from pagan_sossounov import _T_CENSOR_MONTHS, _months_to_weeks
-    from _run_io import save_run
+    from persistence import save_run
 
     ds = _load_ds(model)
     kw = _cfg(model, "obs_kwargs", {})
@@ -115,12 +181,17 @@ def _run_walkforward(model) -> None:
                  oos_start=str(oos_start.date()) if oos_start is not None else None)
     save_run(
         f"regime_{_short_model_name(model)}_{'_'.join(cols)}_walkforward",
-        model=model.__name__.split(".")[-1],
+        model=_module_name(model),
         obs_cols=cols,
         dates=idx, p_bear=p_bear.to_numpy(), label=label,
         price=ds.weekly_price.loc[idx].to_numpy(),
         extra_spec=extra,  # one fit per fold -> no single mcmc
     )
+    # ALSO cache the walk-forward curve under a *_walkforward name so it is available but
+    # NEVER clobbers the canonical GLOBAL curve the strategy/sweeps read by default. The
+    # strategy consumes the GLOBAL fit -- see _write_strategy_cache / load_pbear.
+    _write_strategy_cache(model, _strategy_cache_name(model, "walkforward"),
+                          p_bear.to_numpy(), idx)
 
     model.plot_regime_fit(
         dates=idx, price=ds.weekly_price.loc[idx], r_t=full_obs["r_t"],

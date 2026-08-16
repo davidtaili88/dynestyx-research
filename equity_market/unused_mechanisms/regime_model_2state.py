@@ -63,7 +63,7 @@ _PRIOR_DRIFT_GAP = _PRIOR_BULL_DRIFT_MEAN - _PRIOR_BEAR_DRIFT_MEAN
 # so the calm->turbulent gap in log-vol is ~ 1.04, and it co-moves with the
 # drift sign (calm weeks are the +drift ones), which is exactly why v_t can do
 # the state SEPARATION while drift keeps the LABELS -- see regime_model docstring.
-# NOTE: v_t is already log(realized_vol) (data.py), so these are on the log
+# NOTE: v_t is already log(realized_vol) (data_acquisition.py), so these are on the log
 # scale and a Normal emission on v_t == LogNormal on raw realized vol.
 _PRIOR_CALM_LOG_VOL_MEAN = -5.34  # bull-leaning (low intra-week realized vol)
 _PRIOR_TURBULENT_LOG_VOL_MEAN = -4.30  # bear-leaning (high intra-week realized vol)
@@ -246,7 +246,7 @@ def regime_model(obs_times=None, obs_values=None, predict_times=None):
     # SECOND EMISSION DIMENSION: v_t = observed LOG intra-week realized vol.
     # DECISION / definition, and how it differs from return_vols above:
     #   * v_t is OBSERVED DATA (computed once per week: log-std of that week's
-    #     ~5 daily returns, data.py's weekly_log_realized_vol). return_vols was
+    #     ~5 daily returns, data_acquisition.py's weekly_log_realized_vol). return_vols was
     #     an INFERRED scale parameter of the r_t distribution. Different objects,
     #     different observables -- so this is a genuine extra channel, not a
     #     reparameterization of the return volatility.
@@ -566,10 +566,10 @@ def plot_regime_fit(
     return fig, axes
 
 
-# ---- fit-mode runner hooks (see _run_modes.run_main) ----------------------------
+# ---- fit-mode runner hooks (see fit_mode_processor.run_main) ----------------------------
 # Walk-forward from the shared factory (model-agnostic; only needs fit/filtered_p_bear_over).
 import sys as _sys_wf  # noqa: E402
-from _run_modes import make_walk_forward_p_bear as _make_wf  # noqa: E402
+from fit_mode_processor import make_walk_forward_p_bear as _make_wf  # noqa: E402
 
 walk_forward_p_bear = _make_wf(_sys_wf.modules[__name__])
 
@@ -594,7 +594,7 @@ def main(mode: str | None = None) -> None:
     """Fit + evaluate + plot + save. mode: 'global' (80/20, fast) | 'walkforward'
     (rolling 8yr refits, slow); None -> FIT_MODE. CLI arg overrides:
     `python regime_model_2state.py [global|walkforward]`."""
-    from _run_modes import run_main
+    from fit_mode_processor import run_main
     run_main(_sys_wf.modules[__name__], mode if mode is not None else FIT_MODE)
 
 
